@@ -1,0 +1,31 @@
+# ==============================================================================
+# Easibot: Core & Development Dependencies
+# ==============================================================================
+
+# Multilingual AI Engine (Google GenAI SDK)
+google-genai>=3.6.0
+pydantic>=2.10.0
+
+# Environment & Config
+python-dotenv>=1.2.0
+
+# Voice Pipeline (TTS & Audio Capture)
+edge-tts>=7.0.0
+gTTS>=2.5.0
+sounddevice>=0.5.0
+numpy>=2.0.0
+
+# Display Rendering & Graphics
+pillow>=11.0.0
+
+# Web Dashboard
+flask>=3.0.0
+
+# ==============================================================================
+# Hardware Dependencies (Raspberry Pi Zero 2 W only)
+# (Install via scripts/setup_rpi.sh on Raspberry Pi OS)
+# ==============================================================================
+# gpiozero>=2.0
+# RPi.GPIO>=0.7.1
+# adafruit-circuitpython-rgb-display>=3.10.0
+# spidev>=3.6

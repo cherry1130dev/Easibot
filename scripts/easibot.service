@@ -1,0 +1,18 @@
+[Unit]
+Description=Easibot AI Multilingual Assistant Robot
+After=network-target sound.target bluetooth.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/Easibot
+ExecStart=/home/pi/Easibot/venv/bin/python3 /home/pi/Easibot/main.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

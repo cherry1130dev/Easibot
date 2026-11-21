@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Easibot | Multilingual Assistant Robot Dashboard</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Noto+Sans+Devanagari:wght@400;600&family=Noto+Sans+Telugu:wght@400;600&display=swap" rel="stylesheet">
+</head>
+<body class="dark-theme">
+    <div class="app-container">
+        <!-- Top Navigation -->
+        <header class="app-header">
+            <div class="brand">
+                <div class="robot-avatar">
+                    <span class="avatar-eye left"></span>
+                    <span class="avatar-eye right"></span>
+                </div>
+                <div>
+                    <h1 class="brand-title">EASIBOT <span class="badge-version">Zero 2 W</span></h1>
+                    <p class="brand-sub">AI Multilingual Assistant • English | తెలుగు | हिंदी</p>
+                </div>
+            </div>
+            
+            <div class="header-metrics">
+                <div class="metric-pill">
+                    <span class="metric-dot" id="header-conn-dot"></span>
+                    <span id="header-conn-text">Connecting...</span>
+                </div>
+                <div class="metric-pill">
+                    <span class="metric-icon">🌐</span>
+                    <span id="header-ip">{{ ip_address or '127.0.0.1' }}</span>
+                </div>
+                <div class="metric-pill" id="mode-badge">
+                    <span class="metric-icon">⚡</span>
+                    <span>{% if mock_mode %}Laptop Mock Mode{% else %}Raspberry Pi Hardware{% endif %}</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Dashboard Grid -->
+        <main class="dashboard-grid">
+            <!-- Left Column: Robot Hardware & Live Screen Mirror -->
+            <section class="hardware-panel">
+                <!-- Status & State Card -->
+                <div class="card status-card">
+                    <div class="card-header">
+                        <h3>🤖 Robot Status</h3>
+                        <span class="status-badge" id="robot-state-badge">IDLE</span>
+                    </div>
+
+                    <div class="status-body">
+                        <div class="status-row">
+                            <span class="label">Expression / Emotion:</span>
+                            <span class="val emotion-val" id="robot-emotion-val">Neutral</span>
+                        </div>
+                        <div class="status-row">
+                            <span class="label">Active Language:</span>
+                            <div class="lang-selector-group">
+                                <select id="active-lang-select" class="custom-select">
+                                    {% for code, name in supported_languages.items() %}
+                                    <option value="{{ code }}" {% if code == default_lang %}selected{% endif %}>{{ name }}</option>
+                                    {% endfor %}
+                                </select>
+                            </div>
+                        </div>
+                        <div class="status-row">
+                            <span class="label">Bluetooth Speaker:</span>
+                            <label class="toggle-switch">
+                                <input type="checkbox" id="speaker-toggle" {% if speaker_enabled %}checked{% endif %}>
+                                <span class="slider round"></span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Proximity & Ultrasonic Sensor Card -->
+                <div class="card ultrasonic-card">
+                    <div class="card-header">
+                        <h3>📏 HC-SR04 Proximity</h3>
+                        <span class="proximity-wake-indicator" id="wake-status">Autonomous Wake: ON</span>
+                    </div>
+                    <div class="ultrasonic-body">
+                        <div class="distance-display">
+                            <span class="distance-number" id="distance-number">--</span>
+                            <span class="distance-unit">cm</span>
+                        </div>
+                        <div class="distance-meter">
+                            <div class="distance-bar" id="distance-bar" style="width: 50%;"></div>
+                            <div class="wake-threshold-marker" style="left: 30%;" title="Wake Threshold (60cm)"></div>
+                        </div>
+                        <div class="meter-labels">
+                            <span>0cm</span>
+                            <span class="threshold-label">60cm Wake Zone</span>
+                            <span>200cm</span>
+                        </div>
+
+                        <!-- Manual approach trigger for testing / mock mode -->
+                        <div class="proximity-tester">
+                            <button class="btn btn-secondary btn-sm" id="btn-test-approach" title="Simulates a person walking up to 45cm">
+                                🚶 Test Person Approach (45cm)
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Live TFT Display Mirror -->
+                <div class="card screen-card">
+                    <div class="card-header">
+                        <h3>📺 2.8" SPI TFT LCD Mirror (ILI9341)</h3>
+                        <span class="resolution-badge">320 × 240 px</span>
+                    </div>
+                    <div class="screen-preview-container">
+                        <img id="tft-mirror-img" src="/api/tft_preview" alt="Live TFT Screen Mirror" class="tft-screen-frame">
+                        <div class="screen-glare"></div>
+                    </div>
+                    <p class="screen-caption">Live hardware preview rendered via Pillow ILI9341 pipeline</p>
+                </div>
+
+                <!-- Voice Listen Action -->
+                <div class="card action-card">
+                    <button class="btn btn-primary btn-large btn-mic" id="btn-trigger-mic">
+                        <span class="mic-icon">🎙️</span>
+                        <span id="mic-btn-text">Trigger Voice Listen</span>
+                    </button>
+                    <p class="action-note">Records 5s audio from paired Bluetooth mic and queries Gemini 2.5 Flash.</p>
+                </div>
+            </section>
+
+            <!-- Right Column: Multilingual Chat Dashboard -->
+            <section class="chat-panel">
+                <div class="card chat-card">
+                    <div class="card-header">
+                        <h3>💬 Multilingual AI Chat & Translation</h3>
+                        <div class="chat-badges">
+                            <span class="badge badge-te">తెలుగు</span>
+                            <span class="badge badge-hi">हिंदी</span>
+                            <span class="badge badge-en">English</span>
+                        </div>
+                    </div>
+
+                    <!-- Conversation History Stream -->
+                    <div class="chat-history" id="chat-history">
+                        <div class="chat-bubble bot-bubble">
+                            <div class="bubble-header">
+                                <span class="sender-tag">EASIBOT</span>
+                                <span class="lang-tag en">EN</span>
+                                <span class="time-tag">Now</span>
+                            </div>
+                            <div class="bubble-content">
+                                <p class="text-native">Hello! I am Easibot, your multilingual assistant robot. You can talk to me in English, Telugu, or Hindi!</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Quick Prompt Chips -->
+                    <div class="quick-chips">
+                        <span class="chip-label">Suggestions:</span>
+                        <button class="chip" data-text="Who are you and what can you do?">Who are you?</button>
+                        <button class="chip" data-text="మీరు ఎవరు? మీరు నాకు ఎలా సహాయపడగలరు?">మీరు ఎవరు?</button>
+                        <button class="chip" data-text="नमस्ते! आप क्या कर सकते हैं?">नमस्ते! क्या कर सकते हैं?</button>
+                        <button class="chip" data-text="ఈ రోజు వాతావరణం ఎలా ఉంది?">వాతావరణం ఎలా ఉంది?</button>
+                        <button class="chip" data-text="आज का दिन कैसा रहेगा?">आज का दिन?</button>
+                    </div>
+
+                    <!-- Message Input Box -->
+                    <form class="chat-input-bar" id="chat-form">
+                        <div class="input-options">
+                            <label class="checkbox-container">
+                                <input type="checkbox" id="speak-reply-check" checked>
+                                <span class="checkmark"></span>
+                                🔊 Speak reply on Robot Speaker & TFT
+                            </label>
+                        </div>
+                        <div class="input-row">
+                            <input type="text" id="user-input" class="chat-input" placeholder="Type query in English, Telugu, or Hindi (e.g., 'Ela unnavu?' / 'Namaste')..." autocomplete="off">
+                            <button type="submit" class="btn btn-primary btn-send" id="btn-send">
+                                <span>Send</span>
+                                <span class="send-icon">➤</span>
+                            </button>
+                        </div>
+                    </form>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
