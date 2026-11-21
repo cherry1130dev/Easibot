@@ -40,27 +40,19 @@ try:
 except Exception as e:
     print(f"  ⚠ Could not set Backlight GPIO: {e}")
 
-# Step 1C: Initialize Adafruit ILI9341 and draw test screen
+# Step 1C: Initialize ILI9341 display and draw test screen
 try:
-    import board
-    import digitalio
-    from adafruit_rgb_display import ili9341
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
+    from hardware.ili9341_spi import ILI9341DirectSPI
 
-    spi = board.SPI()
-    cs_pin = digitalio.DigitalInOut(getattr(board, f"D{config.PIN_TFT_CS}"))
-    dc_pin = digitalio.DigitalInOut(getattr(board, f"D{config.PIN_TFT_DC}"))
-    rst_pin = digitalio.DigitalInOut(getattr(board, f"D{config.PIN_TFT_RST}"))
-
-    disp = ili9341.ILI9341(
-        spi,
-        cs=cs_pin,
-        dc=dc_pin,
-        rst=rst_pin,
-        width=240,
-        height=320,
-        rotation=90,
-        baudrate=config.SPI_BAUDRATE
+    disp = ILI9341DirectSPI(
+        port=0,
+        device=0,
+        dc_pin=config.PIN_TFT_DC,
+        rst_pin=config.PIN_TFT_RST,
+        led_pin=config.PIN_TFT_BACKLIGHT,
+        speed_hz=config.SPI_BAUDRATE,
+        rotation=90
     )
 
     # Draw vibrant test image
@@ -80,8 +72,20 @@ try:
     disp.image(test_img)
     print("  ✓ TFT Display initialized and test image pushed to ILI9341!")
 except Exception as e:
-    print(f"  ✗ TFT Display initialization failed: {e}")
-    print("    Check SPI wiring: MOSI->GPIO10 (Pin 19), SCK->GPIO11 (Pin 23), CS->GPIO8 (Pin 24), DC->GPIO24 (Pin 18), RST->GPIO25 (Pin 22), VCC->3.3V, LED->GPIO18 or 3.3V")
+    print(f"  ✗ Direct SPI display failed: {e}")
+    # Try Adafruit fallback
+    try:
+        import board, digitalio
+        from adafruit_rgb_display import ili9341
+        spi = board.SPI()
+        cs_pin = digitalio.DigitalInOut(getattr(board, f"D{config.PIN_TFT_CS}"))
+        dc_pin = digitalio.DigitalInOut(getattr(board, f"D{config.PIN_TFT_DC}"))
+        rst_pin = digitalio.DigitalInOut(getattr(board, f"D{config.PIN_TFT_RST}"))
+        disp = ili9341.ILI9341(spi, cs=cs_pin, dc=dc_pin, rst=rst_pin, width=240, height=320, rotation=90)
+        disp.image(test_img)
+        print("  ✓ TFT Display initialized via Adafruit CircuitPython!")
+    except Exception as e2:
+        print(f"  ✗ Adafruit fallback failed as well: {e2}")
 
 # ==============================================================================
 # TEST 2: Ultrasonic Sensor (HC-SR04)

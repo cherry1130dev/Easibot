@@ -338,7 +338,7 @@ class TFTDisplay:
         self._render_thread: Optional[threading.Thread] = None
         self._state_ref = None
 
-        if not self.mock_mode and RPI_HARDWARE_AVAILABLE:
+        if not self.mock_mode:
             try:
                 self._init_rpi_hardware()
             except Exception as e:
@@ -346,41 +346,59 @@ class TFTDisplay:
                 self.mock_mode = True
                 self.display_device = MockTFTDisplay(painter=self.painter)
         else:
-            if not self.mock_mode and not RPI_HARDWARE_AVAILABLE:
-                logger.warning("Physical display requested, but hardware libraries not available: %s. Using mock.", IMPORT_ERROR)
             self.mock_mode = True
             self.display_device = MockTFTDisplay(painter=self.painter)
 
     def _init_rpi_hardware(self):
-        """Initializes Adafruit CircuitPython ILI9341 on Raspberry Pi."""
-        # 1. Turn on LCD Backlight (GPIO 18)
+        """Initializes ILI9341 display on Raspberry Pi using Direct SPI or Adafruit."""
+        # 1. Try Direct Linux spidev driver first (Avoids '[Errno 16] Device or resource busy' on CE0/GPIO 8)
         try:
-            import RPi.GPIO as GPIO
-            GPIO.setmode(GPIO.BCM)
-            GPIO.setwarnings(False)
-            GPIO.setup(config.PIN_TFT_BACKLIGHT, GPIO.OUT)
-            GPIO.output(config.PIN_TFT_BACKLIGHT, GPIO.HIGH)
-            logger.info("TFT Backlight GPIO %d set to HIGH", config.PIN_TFT_BACKLIGHT)
+            from hardware.ili9341_spi import ILI9341DirectSPI, SPIDEV_HARDWARE_AVAILABLE
+            if SPIDEV_HARDWARE_AVAILABLE:
+                self.display_device = ILI9341DirectSPI(
+                    port=0,
+                    device=0,
+                    dc_pin=config.PIN_TFT_DC,
+                    rst_pin=config.PIN_TFT_RST,
+                    led_pin=config.PIN_TFT_BACKLIGHT,
+                    speed_hz=config.SPI_BAUDRATE,
+                    rotation=config.TFT_ROTATION
+                )
+                logger.info("Physical ILI9341 display initialized via direct spidev driver.")
+                return
         except Exception as e:
-            logger.debug("RPi.GPIO backlight setup note: %s", e)
+            logger.warning("Direct spidev driver failed: %s. Trying Adafruit Blinka fallback...", e)
 
-        # 2. Initialize SPI and Control Pins
-        spi = board.SPI()
-        cs_pin = digitalio.DigitalInOut(getattr(board, f"D{config.PIN_TFT_CS}"))
-        dc_pin = digitalio.DigitalInOut(getattr(board, f"D{config.PIN_TFT_DC}"))
-        rst_pin = digitalio.DigitalInOut(getattr(board, f"D{config.PIN_TFT_RST}"))
+        # 2. Try Adafruit CircuitPython Blinka fallback
+        if RPI_HARDWARE_AVAILABLE:
+            try:
+                import RPi.GPIO as GPIO
+                GPIO.setmode(GPIO.BCM)
+                GPIO.setwarnings(False)
+                GPIO.setup(config.PIN_TFT_BACKLIGHT, GPIO.OUT)
+                GPIO.output(config.PIN_TFT_BACKLIGHT, GPIO.HIGH)
+            except Exception:
+                pass
 
-        self.display_device = ili9341.ILI9341(
-            spi,
-            cs=cs_pin,
-            dc=dc_pin,
-            rst=rst_pin,
-            width=240,
-            height=320,
-            rotation=config.TFT_ROTATION,
-            baudrate=config.SPI_BAUDRATE
-        )
-        logger.info("Physical ILI9341 display initialized successfully over SPI (320x240 landscape).")
+            spi = board.SPI()
+            cs_pin = digitalio.DigitalInOut(getattr(board, f"D{config.PIN_TFT_CS}"))
+            dc_pin = digitalio.DigitalInOut(getattr(board, f"D{config.PIN_TFT_DC}"))
+            rst_pin = digitalio.DigitalInOut(getattr(board, f"D{config.PIN_TFT_RST}"))
+
+            self.display_device = ili9341.ILI9341(
+                spi,
+                cs=cs_pin,
+                dc=dc_pin,
+                rst=rst_pin,
+                width=240,
+                height=320,
+                rotation=config.TFT_ROTATION,
+                baudrate=config.SPI_BAUDRATE
+            )
+            logger.info("Physical ILI9341 display initialized via Adafruit CircuitPython.")
+            return
+
+        raise RuntimeError(f"No working ILI9341 hardware driver found (Blinka import: {IMPORT_ERROR})")
 
     def start_animation_loop(self, state_manager):
         """Starts background rendering loop (~15 FPS)."""
