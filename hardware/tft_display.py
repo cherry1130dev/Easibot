@@ -20,13 +20,15 @@ from hardware.mock_hardware import MockTFTDisplay
 logger = logging.getLogger("easibot.display")
 
 # Try importing hardware libraries for Raspberry Pi
+IMPORT_ERROR = None
 try:
     import board
     import digitalio
     from adafruit_rgb_display import ili9341
     RPI_HARDWARE_AVAILABLE = True
-except (ImportError, NotImplementedError, AttributeError):
+except Exception as e:
     RPI_HARDWARE_AVAILABLE = False
+    IMPORT_ERROR = str(e)
 
 
 class FontManager:
@@ -344,6 +346,8 @@ class TFTDisplay:
                 self.mock_mode = True
                 self.display_device = MockTFTDisplay(painter=self.painter)
         else:
+            if not self.mock_mode and not RPI_HARDWARE_AVAILABLE:
+                logger.warning("Physical display requested, but hardware libraries not available: %s. Using mock.", IMPORT_ERROR)
             self.mock_mode = True
             self.display_device = MockTFTDisplay(painter=self.painter)
 
