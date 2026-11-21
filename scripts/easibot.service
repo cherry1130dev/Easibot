@@ -5,9 +5,9 @@ Wants=bluetooth.target
 
 [Service]
 Type=simple
-User=pi
-WorkingDirectory=/home/pi/Easibot
-ExecStart=/home/pi/Easibot/venv/bin/python3 /home/pi/Easibot/main.py
+User=admin
+WorkingDirectory=/home/admin/Easibot
+ExecStart=/home/admin/Easibot/venv/bin/python3 /home/admin/Easibot/main.py
 Restart=always
 RestartSec=5
 StandardOutput=journal
