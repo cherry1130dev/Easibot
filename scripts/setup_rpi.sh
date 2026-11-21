@@ -24,12 +24,13 @@ sudo apt-get install -y \
     python3-rpi.gpio \
     python3-gpiozero \
     fonts-noto-core \
-    fonts-noto-telugu \
-    fonts-noto-deva \
+    fonts-noto-extra \
+    fonts-telu \
+    fonts-deva \
     fonts-dejavu-core \
     libraqm0 \
     libraqm-dev \
-    libfreetype6-dev \
+    libfreetype-dev \
     libjpeg-dev \
     zlib1g-dev \
     mpg123 \
@@ -40,7 +41,8 @@ sudo apt-get install -y \
     pipewire-audio-client-libraries \
     wireplumber \
     bluez \
-    bluez-tools
+    bluez-tools \
+    curl
 
 # 3. Enable SPI & I2C Hardware Interfaces
 echo "[3/7] Enabling SPI and I2C hardware interfaces..."
@@ -71,11 +73,28 @@ echo "[6/7] Installing Python dependencies..."
 pip install -r requirements.txt
 pip install adafruit-circuitpython-rgb-display RPi.GPIO gpiozero spidev
 
-# 7. Copy Font Files locally if needed
+# 7. Setup & verify TrueType fonts
+echo "[7/7] Setting up multilingual Indic & Latin fonts..."
 mkdir -p assets/fonts
+
+# Try copying from system fonts
 cp -u /usr/share/fonts/truetype/noto/NotoSans-Regular.ttf assets/fonts/ 2>/dev/null || true
 cp -u /usr/share/fonts/truetype/noto/NotoSansTelugu-Regular.ttf assets/fonts/ 2>/dev/null || true
 cp -u /usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf assets/fonts/ 2>/dev/null || true
+
+# Direct fallback download from Google Fonts CDN if not in system directories
+if [ ! -f "assets/fonts/NotoSans-Regular.ttf" ]; then
+    echo "Downloading NotoSans-Regular.ttf..."
+    curl -fsSL -o assets/fonts/NotoSans-Regular.ttf "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans/NotoSans-Regular.ttf" || true
+fi
+if [ ! -f "assets/fonts/NotoSansTelugu-Regular.ttf" ]; then
+    echo "Downloading NotoSansTelugu-Regular.ttf..."
+    curl -fsSL -o assets/fonts/NotoSansTelugu-Regular.ttf "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSansTelugu/NotoSansTelugu-Regular.ttf" || true
+fi
+if [ ! -f "assets/fonts/NotoSansDevanagari-Regular.ttf" ]; then
+    echo "Downloading NotoSansDevanagari-Regular.ttf..."
+    curl -fsSL -o assets/fonts/NotoSansDevanagari-Regular.ttf "https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSansDevanagari/NotoSansDevanagari-Regular.ttf" || true
+fi
 
 echo "======================================================================"
 echo " Easibot setup completed successfully!"

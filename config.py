@@ -162,12 +162,16 @@ FONT_CANDIDATES = {
     "telugu": [
         FONTS_DIR / "NotoSansTelugu-Regular.ttf",
         Path("/usr/share/fonts/truetype/noto/NotoSansTelugu-Regular.ttf"),
-        Path("C:/Windows/Fonts/Nirmala.ttf"),  # Nirmala UI on Windows supports Telugu & Hindi
+        Path("/usr/share/fonts/truetype/fonts-telu-extra/Pothana2000.ttf"),
+        Path("/usr/share/fonts/truetype/lohit-telugu/Lohit-Telugu.ttf"),
+        Path("C:/Windows/Fonts/Nirmala.ttf"),
         Path("C:/Windows/Fonts/gautami.ttf"),
     ],
     "devanagari": [
         FONTS_DIR / "NotoSansDevanagari-Regular.ttf",
         Path("/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf"),
+        Path("/usr/share/fonts/truetype/fonts-deva-extra/Gargi.ttf"),
+        Path("/usr/share/fonts/truetype/lohit-devanagari/Lohit-Devanagari.ttf"),
         Path("C:/Windows/Fonts/Nirmala.ttf"),
         Path("C:/Windows/Fonts/mangal.ttf"),
     ]
