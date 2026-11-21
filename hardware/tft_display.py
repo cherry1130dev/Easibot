@@ -349,6 +349,18 @@ class TFTDisplay:
 
     def _init_rpi_hardware(self):
         """Initializes Adafruit CircuitPython ILI9341 on Raspberry Pi."""
+        # 1. Turn on LCD Backlight (GPIO 18)
+        try:
+            import RPi.GPIO as GPIO
+            GPIO.setmode(GPIO.BCM)
+            GPIO.setwarnings(False)
+            GPIO.setup(config.PIN_TFT_BACKLIGHT, GPIO.OUT)
+            GPIO.output(config.PIN_TFT_BACKLIGHT, GPIO.HIGH)
+            logger.info("TFT Backlight GPIO %d set to HIGH", config.PIN_TFT_BACKLIGHT)
+        except Exception as e:
+            logger.debug("RPi.GPIO backlight setup note: %s", e)
+
+        # 2. Initialize SPI and Control Pins
         spi = board.SPI()
         cs_pin = digitalio.DigitalInOut(getattr(board, f"D{config.PIN_TFT_CS}"))
         dc_pin = digitalio.DigitalInOut(getattr(board, f"D{config.PIN_TFT_DC}"))
@@ -364,7 +376,7 @@ class TFTDisplay:
             rotation=config.TFT_ROTATION,
             baudrate=config.SPI_BAUDRATE
         )
-        logger.info("Physical ILI9341 display initialized successfully over SPI.")
+        logger.info("Physical ILI9341 display initialized successfully over SPI (320x240 landscape).")
 
     def start_animation_loop(self, state_manager):
         """Starts background rendering loop (~15 FPS)."""
