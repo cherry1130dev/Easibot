@@ -137,8 +137,8 @@ PREDEFINED_CONCEPTS = {
     ("good evening",): (
         "en", "Good evening! Ready to assist you with any questions.", "happy", False
     ),
-    ("who are you", "what is your name", "your name"): (
-        "en", "I am Easibot, your multilingual AI assistant robot powered by Raspberry Pi and Gemini!", "happy", False
+    ("who are you", "what is your name", "your name", "which ai", "what ai", "are you gemini"): (
+        "en", "I am Easibot, your friendly interactive assistant robot!", "happy", False
     ),
     ("namaskaram", "ela unnav", "ela unnavu"): (
         "te", "నమస్కారం! నేను చాలా బాగున్నాను. మీకు ఎలా సహాయపడగలను?", "happy", False
@@ -218,7 +218,9 @@ def match_predefined(query: str, lang_pref: str = "auto") -> Optional[RobotReply
 # 3. FAST MULTILINGUAL AI ENGINE (GEMINI 3.5 FLASH-LITE + CONTEXT MEMORY)
 # ==============================================================================
 SYSTEM_PROMPT = (
-    "You are Easibot, a fast, friendly multilingual robot assistant on a Raspberry Pi. "
+    "You are Easibot, a fast, friendly multilingual robot assistant. "
+    "Your identity is strictly Easibot. NEVER say you are Gemini, Google AI, or a large language model. "
+    "If anyone asks who you are or what AI you are, ALWAYS reply that you are Easibot. "
     "Understand English (en), Telugu (te), Hindi (hi), and code-mixed speech. "
     "Use the conversation history to answer follow-up questions naturally. "
     "Keep replies crisp and short (1-2 clear sentences) for fast voice TTS and a small 320x240 screen. "
@@ -295,15 +297,19 @@ def ask_gemini(text_query: Optional[str] = None, audio_wav: Optional[bytes] = No
                 raw = (resp.text or "{}").strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
                 res = RobotReply(**json.loads(raw))
             res.detected_language = _normalize_lang(res.detected_language)
+            for attr in ("reply_native", "reply_english", "reply_romanized"):
+                val = getattr(res, attr, "")
+                val = re.sub(r"\b(google('s)?\s+)?gemini(\s+ai)?\b", "Easibot", val, flags=re.IGNORECASE)
+                setattr(res, attr, val)
             return res
         except Exception as e:
             log.warning("Gemini model %s failed: %s", m, e)
 
     return RobotReply(
         detected_language="en", user_transcript=text_query or "",
-        reply_native="Sorry, I could not reach Gemini right now.",
-        reply_english="Sorry, I could not reach Gemini right now.",
-        reply_romanized="Sorry, I could not reach Gemini right now.",
+        reply_native="Sorry, I am having trouble connecting right now.",
+        reply_english="Sorry, I am having trouble connecting right now.",
+        reply_romanized="Sorry, I am having trouble connecting right now.",
         emotion="neutral", end_conversation=False
     )
 
