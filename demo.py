@@ -26,6 +26,7 @@ import wave
 import math
 import array
 import shutil
+import socket
 import asyncio
 import logging
 import subprocess
@@ -96,8 +97,14 @@ robot = {
     "speech_active": False,
     "mic_info": "Detecting...",
     "speaker_info": "Detecting...",
+    "errors": {"WIFI": False, "BT": False, "MIC": False, "US": False, "AI": False},
 }
 chat_history = []
+
+
+def set_error(key: str, active: bool):
+    with state_lock:
+        robot["errors"][key] = bool(active)
 
 active_gen_id = 0
 last_wake_time = 0.0
@@ -311,10 +318,12 @@ def ask_gemini(text_query: Optional[str] = None, audio_wav: Optional[bytes] = No
                 val = getattr(res, attr, "")
                 val = re.sub(r"\b(google('s)?\s+)?gemini(\s+ai)?\b", "Easibot", val, flags=re.IGNORECASE)
                 setattr(res, attr, val)
+            set_error("AI", False)
             return res
         except Exception as e:
             log.warning("Gemini model %s failed: %s", m, e)
 
+    set_error("AI", True)
     return RobotReply(
         detected_language="en", user_transcript=text_query or "",
         reply_native="Sorry, I am having trouble connecting right now.",
@@ -764,12 +773,13 @@ class SimpleTFT:
             rem = int(math.ceil(robot["listen_remaining"])) if st == "listening" else 0
             tot = max(1.0, robot["listen_total"])
             speech_act = robot["speech_active"]
+            active_errs = sorted(k for k, v in robot["errors"].items() if v)
 
         mode = "response" if hold_resp else "face"
         blink = 1 if (mode == "face" and self.tick % 12 == 0 and st == "idle") else 0
         pulse = (self.tick % 2) if st == "speaking" else 0
         clock_str = time.strftime("%I:%M %p · %d %b").lstrip("0")
-        sig = (mode, st, emo, txt, q_txt, int(dist // 4) if dist > 0 else -1, lang, blink, pulse, rem, speech_act, clock_str)
+        sig = (mode, st, emo, txt, q_txt, int(dist // 4) if dist > 0 else -1, lang, blink, pulse, rem, speech_act, clock_str, tuple(active_errs))
 
         if not force and sig == self._last_signature:
             return
@@ -779,7 +789,7 @@ class SimpleTFT:
         d = ImageDraw.Draw(img)
         accent = EMOTION_COLORS.get(emo, (0, 212, 255))
 
-        # Mobile-UI Top Status Bar (Status | Time & Date | Lang + Distance)
+        # Mobile-UI Top Status Bar (Status | Error Icon | Time & Date | Lang + Distance)
         d.rectangle([(0, 0), (320, 28)], fill=(22, 28, 44))
         d.line([(0, 28), (320, 28)], fill=(45, 55, 72), width=1)
 
@@ -793,12 +803,21 @@ class SimpleTFT:
             d.ellipse([(8, 10), (15, 17)], fill=accent)
             d.text((20, 8), short_st, fill=accent, font=self.font_xs)
 
+        # Warning Triangle Error Icon (when any hardware/software issue exists)
+        if active_errs:
+            d.polygon([(70, 7), (63, 20), (77, 20)], fill=(239, 68, 68))
+            d.line([(70, 11), (70, 15)], fill=(255, 255, 255), width=2)
+            d.point((70, 18), fill=(255, 255, 255))
+            err_lbl = active_errs[0] if len(active_errs) == 1 else f"x{len(active_errs)}"
+            d.text((80, 8), err_lbl, fill=(248, 113, 113), font=self.font_xs)
+
         # Centered Mobile Time & Date
         try:
             cw = d.textbbox((0, 0), clock_str, font=self.font_xs)[2]
         except Exception:
             cw = len(clock_str) * 6
-        d.text(((320 - cw) // 2 + 4, 8), clock_str, fill=(241, 245, 249), font=self.font_xs)
+        clock_x = ((320 - cw) // 2 + 12) if active_errs else ((320 - cw) // 2 + 4)
+        d.text((clock_x, 8), clock_str, fill=(241, 245, 249), font=self.font_xs)
 
         # Right-aligned Language + Proximity
         right_str = f"[{lang.upper()}] {int(dist)}cm" if dist > 0 else f"[{lang.upper()}]"
@@ -897,9 +916,10 @@ def ultrasonic_worker():
         log.info("Ultrasonic HC-SR04 active on TRIG=GPIO%d, ECHO=GPIO%d (trigger %.1f-%.1f cm, 3-hit confirm)", PIN_TRIG, PIN_ECHO, WAKE_MIN_CM, WAKE_DISTANCE_CM)
     except Exception as e:
         log.warning("Ultrasonic GPIO init failed: %s", e)
+        set_error("US", True)
         return
 
-    no_echo_warned, valid_count, hit_streak = False, 0, 0
+    no_echo_warned, valid_count, hit_streak, miss_streak = False, 0, 0, 0
 
     while True:
         # Never interrupt while listening OR giving a spoken response!
@@ -936,6 +956,8 @@ def ultrasonic_worker():
                 dist = round(((t1 - t0) * 34300.0) / 2.0, 1)
                 if 2.0 <= dist <= 400.0:
                     valid_count += 1
+                    miss_streak = 0
+                    set_error("US", False)
                     if valid_count == 1:
                         log.info("Ultrasonic first valid reading: %.1f cm", dist)
                     with state_lock:
@@ -959,6 +981,9 @@ def ultrasonic_worker():
                     hit_streak = 0
             else:
                 hit_streak = 0
+                miss_streak += 1
+                if miss_streak >= 5:
+                    set_error("US", True)
                 with state_lock:
                     robot["distance_cm"] = -1.0
                 if not no_echo_warned and valid_count == 0:
@@ -1152,6 +1177,37 @@ def auto_update_worker():
             os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
+def health_monitor_worker():
+    """Lightweight hardware/software health check for top-bar error icon."""
+    while True:
+        # 1. Wi-Fi / Internet check (<1ms socket check)
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.settimeout(0.5)
+            s.connect(("8.8.8.8", 80))
+            s.close()
+            set_error("WIFI", False)
+        except Exception:
+            set_error("WIFI", True)
+
+        # 2. API Key check
+        if genai_client is None:
+            set_error("AI", True)
+
+        # 3. Bluetooth & Mic check on Linux while idle
+        if not MOCK_HARDWARE and sys.platform.startswith("linux") and robot["state"] == "idle":
+            if shutil.which("pactl"):
+                try:
+                    sinks = subprocess.check_output(["pactl", "list", "short", "sinks"], text=True, stderr=subprocess.DEVNULL)
+                    set_error("BT", "bluez" not in sinks)
+                except Exception:
+                    pass
+            has_mic = bool(_find_usb_alsa_mic() or _find_bluetooth_source())
+            set_error("MIC", not has_mic)
+
+        time.sleep(6.0)
+
+
 if __name__ == "__main__":
     log.info("Starting Easibot (Model=%s, MOCK=%s, TRIG=GPIO%d, ECHO=GPIO%d)", GEMINI_MODEL, MOCK_HARDWARE, PIN_TRIG, PIN_ECHO)
 
@@ -1159,6 +1215,7 @@ if __name__ == "__main__":
     tft_instance.render_and_push(force=True)
     threading.Thread(target=ultrasonic_worker, daemon=True).start()
     threading.Thread(target=auto_update_worker, daemon=True).start()
+    threading.Thread(target=health_monitor_worker, daemon=True).start()
 
     try:
         while True:

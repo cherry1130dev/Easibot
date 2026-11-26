@@ -44,5 +44,16 @@ class TestEasibot(unittest.TestCase):
         self.assertEqual(tft.last_image.size, (320, 240))
 
 
+        # 3. Top-bar Error Icon rendering
+        bot.set_error("WIFI", True)
+        tft.render_and_push(force=True)
+        self.assertEqual(tft.last_image.size, (320, 240))
+        bot.set_error("BT", True)
+        tft.render_and_push(force=True)
+        self.assertEqual(tft.last_image.size, (320, 240))
+        bot.set_error("WIFI", False)
+        bot.set_error("BT", False)
+
+
 if __name__ == "__main__":
     unittest.main()
