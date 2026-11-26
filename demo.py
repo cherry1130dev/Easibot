@@ -60,8 +60,9 @@ PIN_TFT_LED = 18
 WAKE_MIN_CM = float(os.getenv("WAKE_MIN_CM", "5.0"))
 WAKE_DISTANCE_CM = float(os.getenv("WAKE_DISTANCE_CM", "15.0"))
 COOLDOWN_SEC = float(os.getenv("ULTRASONIC_COOLDOWN_SEC", "15.0"))
-LISTEN_TIMEOUT_SEC = float(os.getenv("LISTEN_TIMEOUT_SEC", "5.0"))
-MAX_RECORD_SEC = float(os.getenv("RECORD_DURATION_SEC", "7.0"))
+LISTEN_TIMEOUT_SEC = float(os.getenv("LISTEN_TIMEOUT_SEC", "8.0"))
+MAX_RECORD_SEC = float(os.getenv("RECORD_DURATION_SEC", "12.0"))
+MAX_LISTEN_RETRIES = int(os.getenv("LISTEN_RETRIES", "1"))
 RESPONSE_HOLD_SEC = 8.0
 
 TEMP_DIR = BASE_DIR / "temp_audio"
@@ -1000,6 +1001,7 @@ def run_voice_cycle(from_wake: bool = False, is_interrupt: bool = False, gen_id:
 
     try:
         turn = 0
+        silent_retries = 0
         while gen_id == active_gen_id:
             turn += 1
             interrupt_armed_at = time.time() + 2.2
@@ -1027,6 +1029,14 @@ def run_voice_cycle(from_wake: bool = False, is_interrupt: bool = False, gen_id:
                 return
 
             if not wav:
+                if silent_retries < MAX_LISTEN_RETRIES:
+                    silent_retries += 1
+                    log.info("No speech heard — re-attempting listen (%d/%d)...", silent_retries, MAX_LISTEN_RETRIES)
+                    with state_lock:
+                        robot["state"], robot["emotion"] = "speaking", "neutral"
+                        robot["reply_native"] = "Didn't hear anything. Trying again..."
+                    speak_text("I didn't hear anything. Please speak again.", "en", gen_id=gen_id)
+                    continue
                 with state_lock:
                     if gen_id == active_gen_id:
                         robot["state"], robot["emotion"] = "idle", "happy"
@@ -1046,11 +1056,20 @@ def run_voice_cycle(from_wake: bool = False, is_interrupt: bool = False, gen_id:
                 return
 
             if not res.user_transcript.strip() and res.end_conversation:
+                if silent_retries < MAX_LISTEN_RETRIES:
+                    silent_retries += 1
+                    log.info("Silence detected by AI — re-attempting listen (%d/%d)...", silent_retries, MAX_LISTEN_RETRIES)
+                    with state_lock:
+                        robot["state"], robot["emotion"] = "speaking", "neutral"
+                        robot["reply_native"] = "Didn't hear clearly. Trying again..."
+                    speak_text("I didn't hear you clearly. Please try again.", "en", gen_id=gen_id)
+                    continue
                 with state_lock:
                     if gen_id == active_gen_id:
                         robot["state"], robot["emotion"] = "idle", "happy"
                 break
 
+            silent_retries = 0
             handle_reply(res.user_transcript, res, speak=True, gen_id=gen_id)
             if gen_id != active_gen_id:
                 return
