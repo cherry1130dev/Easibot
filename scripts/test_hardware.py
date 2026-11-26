@@ -1,205 +1,96 @@
 """
-Easibot Hardware Diagnostic & Pinout Verification Tool
-Tests SPI TFT LCD (ILI9341), HC-SR04 Ultrasonic Sensor, and Microphone/Speaker on Raspberry Pi.
+Easibot Standalone Hardware Diagnostic Tool
+Tests 2.8" SPI TFT LCD (ILI9341), HC-SR04 Ultrasonic Sensor, and Audio Devices.
 Run with: python scripts/test_hardware.py
 """
 
-import sys
 import os
 import time
+import subprocess
 from pathlib import Path
+from dotenv import load_dotenv
 
-# Add project root to sys.path
-sys.path.append(str(Path(__file__).resolve().parent.parent))
-import config
+BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(BASE_DIR / ".env")
 
-print("=" * 70)
-print("  EASIBOT HARDWARE DIAGNOSTIC TOOL (Raspberry Pi Zero 2 W)")
-print("=" * 70)
+PIN_TRIG = int(os.getenv("PIN_TRIG", "23"))
+PIN_ECHO = int(os.getenv("PIN_ECHO", "27"))
+PIN_TFT_DC = 24
+PIN_TFT_RST = 25
+PIN_TFT_LED = 18
 
-# ==============================================================================
-# TEST 1: TFT Display & Backlight (ILI9341 - KMRTM28028-SPI)
-# ==============================================================================
-print("\n[TEST 1/3] Testing 2.8\" SPI TFT LCD & Backlight...")
-print(f"  Pins configured: CS=GPIO{config.PIN_TFT_CS}, DC=GPIO{config.PIN_TFT_DC}, RST=GPIO{config.PIN_TFT_RST}, LED=GPIO{config.PIN_TFT_BACKLIGHT}")
+print("=" * 68)
+print("  EASIBOT HARDWARE DIAGNOSTIC TOOL (Raspberry Pi)")
+print("=" * 68)
 
-# Step 1A: Check SPI Device
+# 1. SPI & TFT Test
+print(f"\n[TEST 1/3] Testing 2.8\" SPI TFT LCD (DC=GPIO{PIN_TFT_DC}, RST=GPIO{PIN_TFT_RST}, LED=GPIO{PIN_TFT_LED})...")
 if os.path.exists("/dev/spidev0.0"):
-    print("  ✓ /dev/spidev0.0 exists (SPI interface is enabled).")
+    print("  ✓ /dev/spidev0.0 exists.")
 else:
-    print("  ✗ /dev/spidev0.0 NOT FOUND! Run 'sudo raspi-config nonint do_spi 0' and reboot.")
+    print("  ✗ /dev/spidev0.0 NOT FOUND! Enable SPI via 'sudo raspi-config nonint do_spi 0' and reboot.")
 
-# Step 1B: Turn on Backlight via RPi.GPIO
+try:
+    import sys
+    sys.path.append(str(BASE_DIR))
+    import main as app
+    app.MOCK_HARDWARE = False
+    tft = app.SimpleTFT()
+    app.robot["state"] = "speaking"
+    app.robot["emotion"] = "happy"
+    app.robot["last_question"] = "Hardware Test"
+    app.robot["reply_native"] = "TFT Display & Backlight initialized OK!"
+    tft.render_and_push(force=True)
+    print("  ✓ TFT Display initialized and test screen pushed!")
+except Exception as e:
+    print(f"  ✗ TFT test failed: {e}")
+
+# 2. Ultrasonic Test
+print(f"\n[TEST 2/3] Testing HC-SR04 Ultrasonic (TRIG=GPIO{PIN_TRIG}, ECHO=GPIO{PIN_ECHO})...")
 try:
     import RPi.GPIO as GPIO
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setwarnings(False)
-    GPIO.setup(config.PIN_TFT_BACKLIGHT, GPIO.OUT)
-    GPIO.output(config.PIN_TFT_BACKLIGHT, GPIO.HIGH)
-    print(f"  ✓ Backlight GPIO {config.PIN_TFT_BACKLIGHT} set to HIGH (Screen should be lit).")
-except Exception as e:
-    print(f"  ⚠ Could not set Backlight GPIO: {e}")
-
-# Step 1C: Initialize ILI9341 display and draw test screen
-try:
-    from PIL import Image, ImageDraw
-    from hardware.ili9341_spi import ILI9341DirectSPI
-
-    disp = ILI9341DirectSPI(
-        port=0,
-        device=0,
-        dc_pin=config.PIN_TFT_DC,
-        rst_pin=config.PIN_TFT_RST,
-        led_pin=config.PIN_TFT_BACKLIGHT,
-        speed_hz=config.SPI_BAUDRATE,
-        rotation=90
-    )
-
-    # Draw vibrant test image
-    test_img = Image.new("RGB", (320, 240), (12, 16, 28))
-    draw = ImageDraw.Draw(test_img)
-    # Header bar
-    draw.rectangle([(0, 0), (320, 35)], fill=(0, 212, 255))
-    draw.text((15, 8), "EASIBOT HARDWARE TEST", fill=(0, 0, 0))
-    # Eye test circles
-    draw.rounded_rectangle([(70, 70), (130, 130)], radius=15, fill=(0, 212, 255))
-    draw.rounded_rectangle([(190, 70), (250, 130)], radius=15, fill=(0, 212, 255))
-    # Status card
-    draw.rounded_rectangle([(20, 160), (300, 220)], radius=8, fill=(22, 28, 44), outline=(45, 55, 72))
-    draw.text((35, 175), "TFT DISPLAY INITIALIZED OK!", fill=(72, 239, 128))
-    draw.text((35, 195), "ILI9341 SPI Communications Active", fill=(160, 174, 192))
-
-    disp.image(test_img)
-    print("  ✓ TFT Display initialized and test image pushed to ILI9341!")
-except Exception as e:
-    print(f"  ✗ Direct SPI display failed: {e}")
-    # Try Adafruit fallback
-    try:
-        import board, digitalio
-        from adafruit_rgb_display import ili9341
-        spi = board.SPI()
-        cs_pin = digitalio.DigitalInOut(getattr(board, f"D{config.PIN_TFT_CS}"))
-        dc_pin = digitalio.DigitalInOut(getattr(board, f"D{config.PIN_TFT_DC}"))
-        rst_pin = digitalio.DigitalInOut(getattr(board, f"D{config.PIN_TFT_RST}"))
-        disp = ili9341.ILI9341(spi, cs=cs_pin, dc=dc_pin, rst=rst_pin, width=240, height=320, rotation=90)
-        disp.image(test_img)
-        print("  ✓ TFT Display initialized via Adafruit CircuitPython!")
-    except Exception as e2:
-        print(f"  ✗ Adafruit fallback failed as well: {e2}")
-
-# ==============================================================================
-# TEST 2: Ultrasonic Sensor (HC-SR04)
-# ==============================================================================
-print("\n[TEST 2/3] Testing HC-SR04 Ultrasonic Distance Sensor...")
-print(f"  Pins configured: TRIG=GPIO{config.PIN_TRIG} (Pin 16), ECHO=GPIO{config.PIN_ECHO} (Pin 13 via voltage divider)")
-
-try:
-    import RPi.GPIO as GPIO
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setup(config.PIN_TRIG, GPIO.OUT)
-    GPIO.setup(config.PIN_ECHO, GPIO.IN)
-    GPIO.output(config.PIN_TRIG, False)
+    GPIO.setmode(GPIO.BCM); GPIO.setwarnings(False)
+    GPIO.setup(PIN_TRIG, GPIO.OUT); GPIO.setup(PIN_ECHO, GPIO.IN)
+    GPIO.output(PIN_TRIG, GPIO.LOW)
     time.sleep(0.2)
 
-    print("  Sampling 5 distance readings:")
-    successful_readings = 0
+    ok_count = 0
     for i in range(5):
-        # 10us trigger pulse
-        GPIO.output(config.PIN_TRIG, True)
-        time.sleep(0.00001)
-        GPIO.output(config.PIN_TRIG, False)
-
-        pulse_start = time.time()
-        pulse_end = time.time()
-        timeout = pulse_start + 0.05  # 50ms timeout
-
-        # Wait for echo to go HIGH
-        while GPIO.input(config.PIN_ECHO) == 0:
-            pulse_start = time.time()
-            if pulse_start > timeout:
+        GPIO.output(PIN_TRIG, GPIO.HIGH)
+        time.sleep(0.000012)
+        GPIO.output(PIN_TRIG, GPIO.LOW)
+        t0 = time.perf_counter()
+        deadline = t0 + 0.04
+        while GPIO.input(PIN_ECHO) == 0:
+            t0 = time.perf_counter()
+            if t0 > deadline:
                 break
-
-        # Wait for echo to go LOW
-        while GPIO.input(config.PIN_ECHO) == 1:
-            pulse_end = time.time()
-            if pulse_end > timeout:
+        t1 = t0
+        while GPIO.input(PIN_ECHO) == 1:
+            t1 = time.perf_counter()
+            if t1 > deadline:
                 break
-
-        if pulse_end > pulse_start and (pulse_start <= timeout):
-            duration = pulse_end - pulse_start
-            distance_cm = round((duration * 34300) / 2.0, 1)
-            if 2.0 <= distance_cm <= 400.0:
-                print(f"    Sample {i+1}: {distance_cm} cm (Echo duration: {duration*1000:.2f} ms)")
-                successful_readings += 1
-            else:
-                print(f"    Sample {i+1}: Out of range ({distance_cm} cm)")
+        if t1 > t0 and t0 <= deadline:
+            cm = round(((t1 - t0) * 34300.0) / 2.0, 1)
+            print(f"    Sample {i+1}: {cm} cm")
+            if 2.0 <= cm <= 400.0:
+                ok_count += 1
         else:
-            print(f"    Sample {i+1}: No Echo pulse received (Timeout)")
-
+            print(f"    Sample {i+1}: No Echo (Timeout)")
         time.sleep(0.2)
-
-    if successful_readings > 0:
-        print(f"  ✓ Ultrasonic Sensor working ({successful_readings}/5 valid readings).")
-    else:
-        print("  ✗ Ultrasonic Sensor received NO ECHO!")
-        print("    WIRING CHECKLIST FOR HC-SR04:")
-        print("    1. VCC MUST be connected to 5V (Pin 2 or 4). HC-SR04 will NOT work on 3.3V!")
-        print("    2. GND MUST be connected to Pi Ground (Pin 6, 9, or 14).")
-        print("    3. TRIG -> GPIO 23 (Pin 16).")
-        print("    4. ECHO -> 1k ohm resistor -> GPIO 27 (Pin 13) and 2k ohm resistor to GND.")
+    print(f"  {'✓' if ok_count else '✗'} Valid readings: {ok_count}/5")
 except Exception as e:
-    print(f"  ✗ Ultrasonic test error: {e}")
+    print(f"  ✗ Ultrasonic test failed: {e}")
 
-# ==============================================================================
-# TEST 3: Audio Devices & Microphone
-# ==============================================================================
-print("\n[TEST 3/3] Checking Microphone & Speaker Devices...")
+# 3. Audio Devices
+print("\n[TEST 3/3] Checking Microphones & Speakers...")
+for label, cmd in [("Playback (aplay -l)", ["aplay", "-l"]), ("Capture (arecord -l)", ["arecord", "-l"]), ("PipeWire/Pulse Sinks", ["pactl", "list", "short", "sinks"]), ("PipeWire/Pulse Sources", ["pactl", "list", "short", "sources"])]:
+    print(f"  {label}:")
+    try:
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL).strip()
+        for line in out.splitlines()[:6]:
+            print("   ", line)
+    except Exception:
+        print("    (not available)")
 
-# Check ALSA playback & capture devices
-import subprocess
-
-print("  Playback Sinks (Speakers):")
-try:
-    res = subprocess.run(["aplay", "-l"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    for line in res.stdout.strip().split("\n")[:4]:
-        print("   ", line)
-except Exception:
-    pass
-
-print("\n  Capture Sources (Microphones):")
-has_mic = False
-try:
-    res = subprocess.run(["arecord", "-l"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if "card" in res.stdout:
-        print("    ✓ Detected Hardware Recording Device(s):")
-        for line in res.stdout.strip().split("\n"):
-            print("     ", line)
-        has_mic = True
-    else:
-        print("    ⚠ NO HARDWARE ALSA MICROPHONE DETECTED ('arecord -l' is empty).")
-except Exception:
-    pass
-
-# Check PipeWire / PulseAudio sources
-try:
-    res = subprocess.run(["pactl", "list", "short", "sources"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    if res.stdout.strip():
-        print("    PipeWire/PulseAudio Audio Sources:")
-        for line in res.stdout.strip().split("\n"):
-            print("     ", line)
-            if "bluez" in line or "usb" in line:
-                has_mic = True
-except Exception:
-    pass
-
-if not has_mic:
-    print("\n  [IMPORTANT NOTE ABOUT MICROPHONE ON RASPBERRY PI ZERO 2 W]:")
-    print("  - The Raspberry Pi Zero 2 W has NO ONBOARD MICROPHONE.")
-    print("  - Most portable Bluetooth speakers (like Mini boost 4) only provide audio OUTPUT (A2DP).")
-    print("  - To give voice queries directly to the robot:")
-    print("    1. Plug a standard mini USB microphone into the Pi Zero's USB OTG port, OR")
-    print("    2. Use the Web Dashboard at http://10.133.141.91:5000 from your phone/laptop to type or send queries!")
-
-print("\n" + "=" * 70)
-print("  DIAGNOSTIC COMPLETE")
-print("=" * 70)
+print("\n" + "=" * 68)

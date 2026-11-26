@@ -9,7 +9,6 @@ if [ -d "venv" ]; then
     source venv/bin/activate
 fi
 
-# Ensure output directory exists
-mkdir -p temp_audio web/static/img assets/fonts
+mkdir -p temp_audio assets/fonts
 
 exec python3 main.py "$@"

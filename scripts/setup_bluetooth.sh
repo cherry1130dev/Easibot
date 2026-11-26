@@ -92,10 +92,8 @@ python3 -c "
 import sys
 from pathlib import Path
 sys.path.append(str(Path.cwd()))
-from core.audio_service import AudioService
-svc = AudioService()
-p = svc.synthesize_speech('Bluetooth speaker connected successfully!', 'en')
-if p: svc.play_audio(p)
+from main import speak_text
+speak_text('Bluetooth speaker connected successfully!', 'en')
 " 2>/dev/null || echo "Audio test prompt sent."
 
 echo "======================================================================"

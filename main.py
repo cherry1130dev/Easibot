@@ -1,281 +1,1036 @@
 """
-Easibot: AI-Powered Multilingual Interactive Assistant Robot
-Main Application Orchestrator for Raspberry Pi Zero 2 W / Laptop Mock.
+Easibot - Single-File AI Multilingual Interactive Assistant Robot
+================================================================
+Headless Raspberry Pi Zero W / Zero 2 W Edition (No Web Dashboard).
+
+Features:
+  - Google Gemini 3.5 Flash-Lite (English, Telugu, Hindi + Native Audio Input)
+  - Ultrasonic Proximity Wake (10-15cm range; interrupts while thinking, never cuts off speaking)
+  - Continuous Multi-Turn Voice Chat (remembers context, auto-listens for follow-up questions)
+  - Live Listening Timeout Countdown + Progress Bar on 2.8" SPI TFT LCD
+  - Response-Based Dynamic TFT UI (Big Robot Eyes -> Full-Screen Answer Card)
+  - Auto-Switching Audio: USB Mic / Zebronics Bluetooth Neckband / System Mic + PipeWire/Pulse Speaker
+  - Instant Predefined Commands & Study Concepts (hi, diode, resistor, raspberry pi, etc.)
+
+Run:
+  python main.py
 """
 
 import os
+import re
+import io
 import sys
+import json
 import time
-import signal
+import wave
+import math
+import array
+import shutil
+import asyncio
 import logging
-import argparse
+import subprocess
 import threading
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Literal
 
-# Setup root logger
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] [%(name)s]: %(message)s",
-    datefmt="%H:%M:%S"
+from dotenv import load_dotenv
+from PIL import Image, ImageDraw, ImageFont
+from pydantic import BaseModel, Field
+
+# ==============================================================================
+# 1. CONFIGURATION & LOGGING
+# ==============================================================================
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%H:%M:%S")
+log = logging.getLogger("easibot")
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
+MOCK_HARDWARE = os.getenv("MOCK_HARDWARE", "false" if sys.platform.startswith("linux") else "true").lower() in ("1", "true", "yes")
+
+# GPIO Pins (BCM) - customizable in .env
+PIN_TRIG = int(os.getenv("PIN_TRIG", "23"))   # Default GPIO 23 (Pin 16)
+PIN_ECHO = int(os.getenv("PIN_ECHO", "27"))   # Default GPIO 27 (Pin 13)
+PIN_TFT_DC = 24
+PIN_TFT_RST = 25
+PIN_TFT_LED = 18
+
+# Ultrasonic close-range trigger (10-15 cm target)
+WAKE_MIN_CM = float(os.getenv("WAKE_MIN_CM", "2.0"))
+WAKE_DISTANCE_CM = float(os.getenv("WAKE_DISTANCE_CM", "15.0"))
+COOLDOWN_SEC = float(os.getenv("ULTRASONIC_COOLDOWN_SEC", "15.0"))
+
+LISTEN_TIMEOUT_SEC = float(os.getenv("LISTEN_TIMEOUT_SEC", "5.0"))
+MAX_RECORD_SEC = float(os.getenv("RECORD_DURATION_SEC", "7.0"))
+RESPONSE_HOLD_SEC = 8.0
+
+TEMP_DIR = BASE_DIR / "temp_audio"
+TEMP_DIR.mkdir(exist_ok=True)
+
+TTS_VOICES = {"en": "en-IN-NeerjaNeural", "te": "te-IN-ShrutiNeural", "hi": "hi-IN-SwaraNeural"}
+EMOTION_COLORS = {
+    "neutral": (0, 212, 255), "happy": (72, 239, 128),
+    "listening": (56, 189, 248), "thinking": (245, 158, 11),
+    "speaking": (168, 85, 247), "error": (239, 68, 68),
+}
+
+# Thread-Safe Robot State
+state_lock = threading.Lock()
+robot = {
+    "state": "idle",
+    "emotion": "happy",
+    "language": os.getenv("DEFAULT_LANGUAGE", "auto"),
+    "detected_lang": "en",
+    "distance_cm": -1.0,
+    "speaker_on": os.getenv("ENABLE_SPEAKER_BY_DEFAULT", "true").lower() in ("1", "true", "yes"),
+    "last_question": "",
+    "reply_native": "Hello! I am Easibot. Ready!",
+    "reply_romanized": "Hello! I am Easibot. Ready!",
+    "response_hold_until": 0.0,
+    "listen_remaining": 0.0,
+    "listen_total": LISTEN_TIMEOUT_SEC,
+    "speech_active": False,
+}
+chat_history = []
+
+active_gen_id = 0
+last_wake_time = 0.0
+interrupt_armed_at = 0.0
+active_rec_proc: Optional[subprocess.Popen] = None
+proc_lock = threading.Lock()
+
+
+def interrupt_thinking(reason: str = "Ultrasonic Interrupt"):
+    """Cancels an in-flight thinking request so a new voice command can start immediately."""
+    global active_gen_id, active_rec_proc
+    with state_lock:
+        active_gen_id += 1
+    with proc_lock:
+        if active_rec_proc and active_rec_proc.poll() is None:
+            try:
+                active_rec_proc.terminate()
+            except Exception:
+                pass
+        active_rec_proc = None
+    log.info("⚡ %s! Starting new voice listen (gen_id=%d).", reason, active_gen_id)
+
+
+# ==============================================================================
+# 2. PREDEFINED INSTANT COMMANDS & STUDY CONCEPTS (0ms LOCAL REPLIES)
+# ==============================================================================
+PREDEFINED_CONCEPTS = {
+    ("hi", "hello", "hallo", "hii", "hey", "helo"): (
+        "en", "Hello! I am Easibot. What would you like to learn or ask today?", "happy", False
+    ),
+    ("whatsup", "whats up", "whattup", "watup", "sup"): (
+        "en", "All good and ready to help! Ask me anything or test a study topic.", "happy", False
+    ),
+    ("how are you", "how r u", "how do you do"): (
+        "en", "I am running smoothly and feeling great! How can I help you?", "happy", False
+    ),
+    ("good morning",): (
+        "en", "Good morning! Hope you have a productive day ahead. What can I help with?", "happy", False
+    ),
+    ("good evening",): (
+        "en", "Good evening! Ready to assist you with any questions.", "happy", False
+    ),
+    ("who are you", "what is your name", "your name"): (
+        "en", "I am Easibot, your multilingual AI assistant robot powered by Raspberry Pi and Gemini!", "happy", False
+    ),
+    ("namaskaram", "ela unnav", "ela unnavu"): (
+        "te", "నమస్కారం! నేను చాలా బాగున్నాను. మీకు ఎలా సహాయపడగలను?", "happy", False
+    ),
+    ("namaste", "kaise ho", "kya haal hai"): (
+        "hi", "नमस्ते! मैं बिल्कुल ठीक हूँ। बताइए, मैं आपकी क्या मदद कर सकता हूँ?", "happy", False
+    ),
+    ("bye", "goodbye", "stop", "exit", "thank you bye", "ok bye"): (
+        "en", "Goodbye! Wave near my sensor whenever you need me again.", "happy", True
+    ),
+    ("thanks", "thank you", "thank u"): (
+        "en", "You're very welcome! Do you have another question?", "happy", False
+    ),
+    ("diode",): (
+        "en", "A diode is a two-terminal semiconductor component that lets electric current flow in only one direction, acting like a one-way valve.", "speaking", False
+    ),
+    ("resistor", "resister"): (
+        "en", "A resistor is a passive component that opposes and controls electric current in a circuit, measured in Ohms.", "speaking", False
+    ),
+    ("capacitor",): (
+        "en", "A capacitor stores electrical energy temporarily in an electric field and releases it when needed to smooth voltage.", "speaking", False
+    ),
+    ("transistor",): (
+        "en", "A transistor is a semiconductor device used either to amplify weak electrical signals or to act as a fast electronic switch.", "speaking", False
+    ),
+    ("led",): (
+        "en", "An LED, or Light Emitting Diode, is a special diode that glows and emits light when current flows forward through it.", "speaking", False
+    ),
+    ("raspberry", "raspberry pi", "rasberry"): (
+        "en", "Raspberry Pi is a compact, credit-card-sized single-board computer used for coding, robotics, IoT, and AI projects like me!", "happy", False
+    ),
+    ("arduino",): (
+        "en", "Arduino is an open-source microcontroller platform built for reading sensors, controlling motors, and rapid electronics prototyping.", "speaking", False
+    ),
+    ("ultrasonic", "hc-sr04", "hcsr04"): (
+        "en", "An ultrasonic sensor measures distance by sending high-frequency sound waves and timing how fast the echo bounces back.", "speaking", False
+    ),
+    ("mitochondria", "mitocandra", "mitrocandra", "mitocondria", "mitochondrion"): (
+        "en", "Mitochondria are the powerhouse of the cell because they convert nutrients into ATP, the chemical energy cells need.", "speaking", False
+    ),
+    ("ohms law", "ohm's law", "ohm law"): (
+        "en", "Ohm's Law states that Voltage equals Current multiplied by Resistance, written as V equals I times R.", "speaking", False
+    ),
+}
+
+
+class RobotReply(BaseModel):
+    detected_language: Literal["en", "te", "hi"] = Field(description="'en', 'te', or 'hi'")
+    user_transcript: str = Field(description="Short summary/transcript of what the user asked")
+    reply_native: str = Field(description="Concise 1-2 sentence reply in native script (Telugu/Hindi/English)")
+    reply_english: str = Field(description="English translation of reply_native")
+    reply_romanized: str = Field(description="Latin/English phonetic transliteration for TFT screen")
+    emotion: Literal["happy", "thinking", "listening", "speaking", "neutral"] = Field(description="Robot expression")
+    end_conversation: bool = Field(description="True ONLY if user says bye/stop/goodbye/no more questions")
+
+
+def match_predefined(query: str, lang_pref: str = "auto") -> Optional[RobotReply]:
+    clean = re.sub(r"[^\w\s']", " ", (query or "").lower()).strip()
+    clean = re.sub(r"\s+", " ", clean)
+    if not clean:
+        return None
+    words = set(clean.split())
+    for keys, (lang, text, emo, end_conv) in PREDEFINED_CONCEPTS.items():
+        if lang_pref in ("te", "hi") and lang != lang_pref:
+            continue
+        for k in keys:
+            if clean == k or (len(words) <= 6 and (f" {k} " in f" {clean} " or clean.endswith(f" {k}"))):
+                return RobotReply(
+                    detected_language=lang, user_transcript=query.strip(),
+                    reply_native=text, reply_english=text, reply_romanized=text,
+                    emotion=emo, end_conversation=end_conv
+                )
+    return None
+
+
+# ==============================================================================
+# 3. FAST MULTILINGUAL AI ENGINE (GEMINI 3.5 FLASH-LITE + CONTEXT MEMORY)
+# ==============================================================================
+SYSTEM_PROMPT = (
+    "You are Easibot, a fast, friendly multilingual robot assistant on a Raspberry Pi. "
+    "Understand English (en), Telugu (te), Hindi (hi), and code-mixed speech. "
+    "Use the conversation history to answer follow-up questions naturally. "
+    "Keep replies crisp and short (1-2 clear sentences) for fast voice TTS and a small 320x240 screen. "
+    "If the audio is just silence or background noise with no speech, set user_transcript='' and end_conversation=true."
 )
-logger = logging.getLogger("easibot.main")
 
-import config
-from core.state_manager import StateManager, RobotState, Emotion
-from core.gemini_service import GeminiService
-from core.audio_service import AudioService
-from hardware.tft_display import TFTDisplay
-from hardware.ultrasonic import UltrasonicSensor
-from web.app import create_app
+genai_client = None
+if GEMINI_API_KEY and GEMINI_API_KEY != "your_gemini_api_key_here":
+    try:
+        from google import genai
+        from google.genai import types
+        genai_client = genai.Client(api_key=GEMINI_API_KEY)
+        log.info("Gemini AI client ready (primary model: %s)", GEMINI_MODEL)
+    except Exception as e:
+        log.warning("Gemini init failed: %s", e)
 
 
-class EasibotApp:
-    """Master application coordinator."""
+def _normalize_lang(lang: str) -> str:
+    l = (lang or "en").lower().strip()
+    return "te" if l.startswith("te") else ("hi" if l.startswith("hi") else "en")
 
-    def __init__(self, mock_hardware: bool = config.MOCK_HARDWARE):
-        logger.info("Initializing Easibot Multilingual Robot Assistant...")
-        logger.info("Operating Mode: %s", "MOCK HARDWARE (Laptop Mode)" if mock_hardware else "PHYSICAL HARDWARE (Raspberry Pi)")
 
-        # 1. Thread-safe State Manager
-        self.state_mgr = StateManager(
-            default_language=config.DEFAULT_LANGUAGE,
-            speaker_enabled=config.ENABLE_SPEAKER_BY_DEFAULT
-        )
-        self.state_mgr.set_mock_mode(mock_hardware)
+def ask_gemini(text_query: Optional[str] = None, audio_wav: Optional[bytes] = None, lang_pref: str = "auto", gen_id: int = 0) -> Optional[RobotReply]:
+    if text_query:
+        instant = match_predefined(text_query, lang_pref)
+        if instant:
+            log.info("⚡ Predefined reply matched for: '%s'", text_query)
+            return instant
 
-        # 2. Multilingual AI Service (Google Gemini)
-        self.gemini_svc = GeminiService()
-
-        # 3. Audio & Voice Pipeline
-        self.audio_svc = AudioService()
-
-        # 4. 2.8" SPI TFT LCD Display
-        self.tft = TFTDisplay(mock_override=mock_hardware)
-
-        # 5. HC-SR04 Ultrasonic Distance Sensor
-        self.ultrasonic = UltrasonicSensor(
-            on_wake_callback=self.on_ultrasonic_wake,
-            mock_override=mock_hardware
+    if not genai_client:
+        return RobotReply(
+            detected_language="en", user_transcript=text_query or "",
+            reply_native="API Key not set. Predefined study commands work offline!",
+            reply_english="API Key not set.", reply_romanized="API Key not set.",
+            emotion="neutral", end_conversation=False
         )
 
-        # 6. Web Dashboard & REST API
-        self.flask_app = create_app(
-            state_manager=self.state_mgr,
-            gemini_service=self.gemini_svc,
-            audio_service=self.audio_svc,
-            tft_display=self.tft,
-            ultrasonic_sensor=self.ultrasonic,
-            trigger_listen_callback=self.trigger_voice_cycle
-        )
+    instr = SYSTEM_PROMPT
+    if lang_pref in ("en", "te", "hi"):
+        instr += f" IMPORTANT: Reply strictly in language '{lang_pref}'."
 
-        self._running = False
-        self._voice_lock = threading.Lock()
+    with state_lock:
+        hist_lines = [f"{h['role']}: {h['text']}" for h in chat_history[-6:]]
+    history_ctx = ("Recent conversation:\n" + "\n".join(hist_lines) + "\n\n") if hist_lines else ""
 
-    def start(self):
-        """Starts all background hardware loops and web server."""
-        self._running = True
+    cfg = types.GenerateContentConfig(
+        system_instruction=instr,
+        response_mime_type="application/json",
+        response_schema=RobotReply,
+        temperature=0.6,
+    )
 
-        # Start TFT display animation loop
-        self.tft.start_animation_loop(self.state_mgr)
+    if audio_wav:
+        contents = [
+            types.Part.from_bytes(data=audio_wav, mime_type="audio/wav"),
+            f"{history_ctx}Listen to the user's audio above, transcribe it, and answer naturally."
+        ]
+    else:
+        contents = f"{history_ctx}User: {text_query}"
 
-        # Start Ultrasonic distance sensor loop
-        self.ultrasonic.start()
+    models = [GEMINI_MODEL, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.5-flash"]
+    for m in dict.fromkeys(models):
+        if gen_id and gen_id != active_gen_id:
+            return None
+        try:
+            t0 = time.time()
+            resp = genai_client.models.generate_content(model=m, contents=contents, config=cfg)
+            if gen_id and gen_id != active_gen_id:
+                return None
+            log.info("Gemini (%s) replied in %.2fs", m, time.time() - t0)
+            if getattr(resp, "parsed", None):
+                res = resp.parsed if isinstance(resp.parsed, RobotReply) else RobotReply(**resp.parsed)
+            else:
+                raw = (resp.text or "{}").strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                res = RobotReply(**json.loads(raw))
+            res.detected_language = _normalize_lang(res.detected_language)
+            return res
+        except Exception as e:
+            log.warning("Gemini model %s failed: %s", m, e)
 
-        # Start Flask web server in daemon thread
-        web_thread = threading.Thread(
-            target=lambda: self.flask_app.run(
-                host=config.WEB_HOST,
-                port=config.WEB_PORT,
-                debug=False,
-                use_reloader=False,
-                threaded=True
-            ),
-            daemon=True,
-            name="FlaskServerThread"
-        )
-        web_thread.start()
-        logger.info("Web Dashboard live at: http://%s:%d (or http://localhost:%d)", self.state_mgr._ip_address, config.WEB_PORT, config.WEB_PORT)
+    return RobotReply(
+        detected_language="en", user_transcript=text_query or "",
+        reply_native="Sorry, I could not reach Gemini right now.",
+        reply_english="Sorry, I could not reach Gemini right now.",
+        reply_romanized="Sorry, I could not reach Gemini right now.",
+        emotion="neutral", end_conversation=False
+    )
 
-        # Greet user on boot
-        self._boot_greeting()
 
-    def _boot_greeting(self):
-        """Initial welcome greeting on TFT and speaker."""
-        active_lang = self.state_mgr.active_language
-        welcome_info = config.WELCOME_GREETINGS.get(active_lang, config.WELCOME_GREETINGS["en"])
+# ==============================================================================
+# 4. SMART AUDIO: AUTO-DETECT USB MIC / BLUETOOTH + RELIABLE SPEAKER ROUTING
+# ==============================================================================
+_cached_mic_mode = None
 
-        self.state_mgr.record_turn(
-            user_query="",
-            reply_native=welcome_info["text"],
-            reply_english=config.WELCOME_GREETINGS["en"]["text"],
-            reply_romanized=welcome_info["romanized"],
-            emotion="happy",
-            detected_language=welcome_info["lang"]
-        )
-        self.state_mgr.set_state(RobotState.IDLE, Emotion.HAPPY)
 
-    # =========================================================================
-    # Autonomous Wake & Voice Interaction Cycle
-    # =========================================================================
-    def on_ultrasonic_wake(self):
-        """Called when ultrasonic sensor detects person within 60 cm."""
-        if not self.state_mgr.can_trigger_wake(config.ULTRASONIC_COOLDOWN_SEC):
+def _find_usb_alsa_mic() -> Optional[str]:
+    if not shutil.which("arecord"):
+        return None
+    try:
+        out = subprocess.check_output(["arecord", "-l"], text=True, stderr=subprocess.DEVNULL)
+        usb_cards, any_cards = [], []
+        for line in out.splitlines():
+            m = re.match(r"card (\d+):.*device (\d+):", line)
+            if m:
+                dev_str = f"plughw:{m.group(1)},{m.group(2)}"
+                any_cards.append(dev_str)
+                if any(k in line.lower() for k in ("usb", "pnp", "mic", "webcam", "audio")):
+                    usb_cards.append(dev_str)
+        return usb_cards[0] if usb_cards else (any_cards[0] if any_cards else None)
+    except Exception:
+        return None
+
+
+def _find_bluetooth_source() -> Optional[str]:
+    if not shutil.which("pactl"):
+        return None
+    try:
+        sources = subprocess.check_output(["pactl", "list", "short", "sources"], text=True, stderr=subprocess.DEVNULL)
+        for s in sources.splitlines():
+            if ("bluez_input" in s or "bluez_source" in s) and "monitor" not in s:
+                return s.split()[1]
+        cards = subprocess.check_output(["pactl", "list", "cards", "short"], text=True, stderr=subprocess.DEVNULL)
+        for line in cards.splitlines():
+            if "bluez_card" in line:
+                card_name = line.split()[1]
+                for prof in ("headset-head-unit", "headset-head-unit-msbc", "headset-head-unit-cvsd", "handsfree_head_unit"):
+                    if subprocess.run(["pactl", "set-card-profile", card_name, prof], stderr=subprocess.DEVNULL).returncode == 0:
+                        time.sleep(0.8)
+                        sources = subprocess.check_output(["pactl", "list", "short", "sources"], text=True, stderr=subprocess.DEVNULL)
+                        for s in sources.splitlines():
+                            if "bluez" in s and "monitor" not in s:
+                                return s.split()[1]
+    except Exception:
+        pass
+    return None
+
+
+def _ensure_linux_speaker_ready():
+    """Ensures Bluetooth or USB/ALSA sink is selected, unmuted, and at 100% volume."""
+    if not sys.platform.startswith("linux") or not shutil.which("pactl"):
+        return
+    try:
+        sinks = subprocess.check_output(["pactl", "list", "short", "sinks"], text=True, stderr=subprocess.DEVNULL)
+        lines = [l.split()[1] for l in sinks.splitlines() if len(l.split()) >= 2]
+        bt_sinks = [s for s in lines if "bluez" in s]
+        target = bt_sinks[0] if bt_sinks else (lines[0] if lines else None)
+        if target:
+            subprocess.run(["pactl", "set-default-sink", target], stderr=subprocess.DEVNULL)
+            subprocess.run(["pactl", "set-sink-mute", target, "0"], stderr=subprocess.DEVNULL)
+            subprocess.run(["pactl", "set-sink-volume", target, "100%"], stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
+def _chunk_rms(pcm_bytes: bytes) -> float:
+    if len(pcm_bytes) < 2:
+        return 0.0
+    samples = array.array("h")
+    samples.frombytes(pcm_bytes[: len(pcm_bytes) - (len(pcm_bytes) % 2)])
+    return math.sqrt(sum(s * s for s in samples) / len(samples)) if samples else 0.0
+
+
+def _record_raw_stream_vad(cmd: list, wait_speech_sec: float = LISTEN_TIMEOUT_SEC, max_sec: float = MAX_RECORD_SEC, gen_id: int = 0) -> Optional[bytes]:
+    global active_rec_proc
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    with proc_lock:
+        active_rec_proc = proc
+
+    chunk_bytes = 6400
+    noise_samples, recorded_chunks = [], []
+    speech_started, silence_chunks = False, 0
+    max_chunks = int(max_sec / 0.2)
+    wait_chunks = int(wait_speech_sec / 0.2)
+    threshold = 350.0
+
+    with state_lock:
+        robot["listen_total"] = wait_speech_sec
+        robot["listen_remaining"] = wait_speech_sec
+        robot["speech_active"] = False
+
+    try:
+        for idx in range(max_chunks):
+            if gen_id and gen_id != active_gen_id:
+                return None
+
+            data = proc.stdout.read(chunk_bytes)
+            if not data:
+                break
+            rms = _chunk_rms(data)
+
+            elapsed = (idx + 1) * 0.2
+            with state_lock:
+                if not speech_started:
+                    robot["listen_total"] = wait_speech_sec
+                    robot["listen_remaining"] = max(0.0, round(wait_speech_sec - elapsed, 1))
+                else:
+                    robot["listen_total"] = max_sec
+                    robot["listen_remaining"] = max(0.0, round(max_sec - elapsed, 1))
+
+            if idx < 2:
+                noise_samples.append(rms)
+                recorded_chunks.append(data)
+                threshold = max(240.0, (sum(noise_samples) / len(noise_samples)) * 2.2)
+                continue
+
+            recorded_chunks.append(data)
+
+            if rms > threshold:
+                if not speech_started:
+                    speech_started = True
+                    with state_lock:
+                        robot["speech_active"] = True
+                silence_chunks = 0
+            elif speech_started:
+                silence_chunks += 1
+                if silence_chunks >= 5:
+                    log.info("Speech ended cleanly at %.1fs", elapsed)
+                    break
+            elif idx >= wait_chunks:
+                log.info("Listening timeout (%.1fs elapsed, no speech).", wait_speech_sec)
+                return None
+    finally:
+        with proc_lock:
+            if active_rec_proc == proc:
+                active_rec_proc = None
+        proc.terminate()
+        try:
+            proc.wait(timeout=1.0)
+        except Exception:
+            proc.kill()
+
+    if not speech_started:
+        return None
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000)
+        wf.writeframes(b"".join(recorded_chunks))
+    return buf.getvalue()
+
+
+def record_voice(wait_speech_sec: float = LISTEN_TIMEOUT_SEC, gen_id: int = 0) -> Optional[bytes]:
+    global _cached_mic_mode
+
+    if _cached_mic_mode is None:
+        usb_dev = _find_usb_alsa_mic()
+        if usb_dev and shutil.which("arecord"):
+            _cached_mic_mode = ("usb", usb_dev)
+            log.info("Using USB Microphone: %s", usb_dev)
+        else:
+            bt_src = _find_bluetooth_source()
+            if bt_src and shutil.which("parecord"):
+                _cached_mic_mode = ("bt", bt_src)
+                log.info("Using Bluetooth Microphone: %s", bt_src)
+            elif shutil.which("parecord"):
+                _cached_mic_mode = ("pa", None)
+                log.info("Using System Microphone (parecord)")
+            else:
+                _cached_mic_mode = ("sd", None)
+
+    mode, dev = _cached_mic_mode
+    try:
+        if mode == "usb":
+            return _record_raw_stream_vad(["arecord", "-D", dev, "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "raw", "-q"], wait_speech_sec, gen_id=gen_id)
+        elif mode == "bt":
+            return _record_raw_stream_vad(["parecord", "-d", dev, "--raw", "--rate=16000", "--channels=1", "--format=s16le"], wait_speech_sec, gen_id=gen_id)
+        elif mode == "pa":
+            return _record_raw_stream_vad(["parecord", "--raw", "--rate=16000", "--channels=1", "--format=s16le"], wait_speech_sec, gen_id=gen_id)
+        else:
+            import sounddevice as sd
+            rec_sec = min(wait_speech_sec, MAX_RECORD_SEC)
+            with state_lock:
+                robot["listen_total"] = rec_sec
+                robot["listen_remaining"] = rec_sec
+                robot["speech_active"] = False
+            rec = sd.rec(int(rec_sec * 16000), samplerate=16000, channels=1, dtype="int16")
+            start = time.time()
+            while time.time() - start < rec_sec:
+                if gen_id and gen_id != active_gen_id:
+                    sd.stop()
+                    return None
+                with state_lock:
+                    robot["listen_remaining"] = max(0.0, round(rec_sec - (time.time() - start), 1))
+                time.sleep(0.25)
+            sd.wait()
+            raw = rec.tobytes()
+            if _chunk_rms(raw) < 120.0:
+                return None
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as wf:
+                wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000); wf.writeframes(raw)
+            return buf.getvalue()
+    except Exception as e:
+        log.warning("Mic recording error (%s) — resetting mic cache.", e)
+        _cached_mic_mode = None
+        return None
+
+
+def play_ready_beep():
+    if not robot["speaker_on"]:
+        return
+    beep_path = TEMP_DIR / "ready_beep.wav"
+    if not beep_path.exists():
+        frames = bytearray()
+        for i in range(int(16000 * 0.12)):
+            env = math.sin(math.pi * i / (16000 * 0.12))
+            val = int(6000.0 * env * math.sin(2.0 * math.pi * 587.0 * i / 16000))
+            frames.extend(val.to_bytes(2, "little", signed=True))
+        with wave.open(str(beep_path), "wb") as wf:
+            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000); wf.writeframes(frames)
+
+    if sys.platform.startswith("linux"):
+        _ensure_linux_speaker_ready()
+        for cmd in (["pw-play", str(beep_path)], ["paplay", str(beep_path)], ["aplay", "-q", str(beep_path)]):
+            if shutil.which(cmd[0]) and subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                break
+    elif sys.platform.startswith("win"):
+        subprocess.run(["powershell", "-c", f"(New-Object Media.SoundPlayer '{beep_path}').PlaySync()"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _run_player_checked(cmd: list) -> bool:
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if res.returncode == 0:
+            return True
+        log.warning("Player %s failed (code %d): %s", cmd[0], res.returncode, (res.stderr or b"").decode(errors="ignore")[:120])
+        return False
+    except Exception as e:
+        log.warning("Player %s exception: %s", cmd[0], e)
+        return False
+
+
+def speak_text(text: str, lang: str = "en"):
+    """Synthesizes TTS (edge-tts -> gTTS -> espeak) and plays completely without interruption."""
+    if not text.strip() or not robot["speaker_on"]:
+        return
+
+    log.info("🔊 Speaking [%s]: %s", lang, text[:60])
+    mp3_path = TEMP_DIR / f"tts_{int(time.time()*1000)}.mp3"
+    wav_path = TEMP_DIR / f"tts_{int(time.time()*1000)}.wav"
+    voice = TTS_VOICES.get(lang, TTS_VOICES["en"])
+    synthesized = False
+
+    try:
+        import edge_tts
+        async def _synth():
+            await asyncio.wait_for(edge_tts.Communicate(text, voice).save(str(mp3_path)), timeout=6.0)
+        asyncio.run(_synth())
+        synthesized = mp3_path.exists() and mp3_path.stat().st_size > 300
+    except Exception as e:
+        log.warning("edge-tts failed (%s), trying gTTS...", e)
+
+    if not synthesized:
+        try:
+            from gtts import gTTS
+            gTTS(text=text, lang=lang if lang in ("en", "te", "hi") else "en").save(str(mp3_path))
+            synthesized = mp3_path.exists() and mp3_path.stat().st_size > 300
+        except Exception as e:
+            log.warning("gTTS failed (%s)", e)
+
+    try:
+        if sys.platform.startswith("linux"):
+            _ensure_linux_speaker_ready()
+            played = False
+
+            if synthesized:
+                if shutil.which("mpg123"):
+                    if subprocess.run(["mpg123", "-q", "-w", str(wav_path), str(mp3_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0 and wav_path.exists():
+                        for cmd in (["pw-play", str(wav_path)], ["paplay", str(wav_path)], ["aplay", "-q", str(wav_path)]):
+                            if shutil.which(cmd[0]) and _run_player_checked(cmd):
+                                played = True
+                                break
+
+                if not played:
+                    for cmd in (
+                        ["mpg123", "-o", "pulse", "-q", str(mp3_path)],
+                        ["mpg123", "-q", str(mp3_path)],
+                        ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(mp3_path)],
+                        ["cvlc", "--play-and-exit", "--quiet", str(mp3_path)],
+                    ):
+                        if shutil.which(cmd[0]) and _run_player_checked(cmd):
+                            played = True
+                            break
+
+            if not played:
+                for esp in ("espeak-ng", "espeak"):
+                    if shutil.which(esp) and _run_player_checked([esp, text]):
+                        break
+
+        elif sys.platform.startswith("win") and synthesized:
+            if not (shutil.which("ffplay") and _run_player_checked(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", str(mp3_path)])):
+                ps = f"$w=New-Object -ComObject WMPlayer.OCX;$w.URL='{mp3_path}';$w.controls.play();while($w.playState -ne 1){{Start-Sleep -Milliseconds 100}}"
+                subprocess.run(["powershell", "-c", ps], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    finally:
+        mp3_path.unlink(missing_ok=True)
+        wav_path.unlink(missing_ok=True)
+
+
+# ==============================================================================
+# 5. RESPONSE-BASED DYNAMIC 2.8" SPI TFT DISPLAY (320x240)
+# ==============================================================================
+class SimpleTFT:
+    def __init__(self):
+        self.spi = None
+        self.GPIO = None
+        self.mock = MOCK_HARDWARE
+        self.font_xs = self._load_font(["NotoSans-Regular.ttf", "DejaVuSans.ttf", "arial.ttf"], 11)
+        self.font_sm = self._load_font(["NotoSans-Regular.ttf", "DejaVuSans.ttf", "arial.ttf"], 13)
+        self.font_md = self._load_font(["NotoSans-Regular.ttf", "DejaVuSans.ttf", "arial.ttf"], 15)
+        self.font_lg = self._load_font(["NotoSans-Regular.ttf", "DejaVuSans.ttf", "arial.ttf"], 17)
+        self.tick = 0
+        self._last_signature = None
+        self.last_image: Optional[Image.Image] = None
+
+        if not self.mock:
+            try:
+                import spidev, RPi.GPIO as GPIO
+                self.GPIO = GPIO
+                GPIO.setmode(GPIO.BCM); GPIO.setwarnings(False)
+                for p in (PIN_TFT_DC, PIN_TFT_RST, PIN_TFT_LED):
+                    GPIO.setup(p, GPIO.OUT)
+                GPIO.output(PIN_TFT_LED, GPIO.HIGH)
+
+                self.spi = spidev.SpiDev()
+                self.spi.open(0, 0)
+                self.spi.max_speed_hz = 24000000
+                self.spi.mode = 0
+                self._init_ili9341()
+                log.info("TFT Display ready on /dev/spidev0.0 (Backlight GPIO %d ON)", PIN_TFT_LED)
+            except Exception as e:
+                log.warning("TFT hardware init skipped (%s) -> Mock mode", e)
+                self.mock = True
+
+    def _load_font(self, names, size):
+        for d in [BASE_DIR / "assets" / "fonts", Path("/usr/share/fonts/truetype/noto"), Path("/usr/share/fonts/truetype/dejavu"), Path("C:/Windows/Fonts")]:
+            for n in names:
+                p = d / n
+                if p.exists():
+                    try:
+                        return ImageFont.truetype(str(p), size)
+                    except Exception:
+                        pass
+        return ImageFont.load_default()
+
+    def _cmd(self, c):
+        self.GPIO.output(PIN_TFT_DC, self.GPIO.LOW); self.spi.writebytes([c])
+
+    def _dat(self, d):
+        self.GPIO.output(PIN_TFT_DC, self.GPIO.HIGH)
+        self.spi.writebytes([d] if isinstance(d, int) else list(d))
+
+    def _init_ili9341(self):
+        self.GPIO.output(PIN_TFT_RST, self.GPIO.LOW); time.sleep(0.05)
+        self.GPIO.output(PIN_TFT_RST, self.GPIO.HIGH); time.sleep(0.12)
+        for cmd, data in [
+            (0x01, None), (0xCB, [0x39, 0x2C, 0x00, 0x34, 0x02]), (0xCF, [0x00, 0xC1, 0x30]),
+            (0xE8, [0x85, 0x00, 0x78]), (0xEA, [0x00, 0x00]), (0xED, [0x64, 0x03, 0x12, 0x81]),
+            (0xF7, [0x20]), (0xC0, [0x23]), (0xC1, [0x10]), (0xC5, [0x3E, 0x28]),
+            (0xC7, [0x86]), (0x36, [0xE8]), (0x3A, [0x55]), (0xB1, [0x00, 0x18]),
+            (0xB6, [0x08, 0x82, 0x27]), (0x11, None), (0x29, None)
+        ]:
+            self._cmd(cmd)
+            if data: self._dat(data)
+            if cmd in (0x01, 0x11): time.sleep(0.12)
+
+    def _wrap_text(self, draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_w: int, max_lines: int) -> list:
+        words = (text or "").split()
+        lines, cur = [], ""
+        for w in words:
+            test = f"{cur} {w}".strip()
+            try:
+                tw = draw.textbbox((0, 0), test, font=font)[2]
+            except Exception:
+                tw = len(test) * 8
+            if tw <= max_w:
+                cur = test
+            else:
+                if cur:
+                    lines.append(cur)
+                cur = w
+        if cur:
+            lines.append(cur)
+        if len(lines) > max_lines:
+            lines = lines[:max_lines]
+            lines[-1] = lines[-1][:-3] + "..." if len(lines[-1]) > 3 else "..."
+        return lines or [""]
+
+    def render_and_push(self, force: bool = False):
+        self.tick += 1
+        now = time.time()
+        with state_lock:
+            st, emo = robot["state"], robot["emotion"]
+            dist, lang = robot["distance_cm"], robot["detected_lang"]
+            q_txt = robot["last_question"]
+            txt = robot["reply_native"] if lang == "en" else (robot["reply_romanized"] or robot["reply_native"])
+            hold_resp = (st == "speaking") or (st == "idle" and now < robot["response_hold_until"])
+            rem = int(math.ceil(robot["listen_remaining"])) if st == "listening" else 0
+            tot = max(1.0, robot["listen_total"])
+            speech_act = robot["speech_active"]
+
+        mode = "response" if hold_resp else "face"
+        blink = 1 if (mode == "face" and self.tick % 12 == 0 and st == "idle") else 0
+        pulse = (self.tick % 2) if st == "speaking" else 0
+        sig = (mode, st, emo, txt, q_txt, int(dist // 4) if dist > 0 else -1, lang, blink, pulse, rem, speech_act)
+
+        if not force and sig == self._last_signature:
             return
+        self._last_signature = sig
 
-        logger.info("Human detected near robot! Initiating autonomous greeting & voice cycle...")
-        
-        # 1. State: WAKING with greeting
-        self.state_mgr.set_state(RobotState.WAKING, Emotion.HAPPY)
-        
-        # Play short chime or greeting if speaker enabled
-        active_lang = self.state_mgr.active_language
-        welcome_info = config.WELCOME_GREETINGS.get(active_lang, config.WELCOME_GREETINGS["en"])
-        
-        if self.state_mgr.speaker_enabled:
-            tts_file = self.audio_svc.synthesize_speech(
-                text="Hello! I am listening.",
-                language="en"
-            )
-            if tts_file:
-                self.audio_svc.play_audio(tts_file, blocking=True)
+        img = Image.new("RGB", (320, 240), (12, 16, 28))
+        d = ImageDraw.Draw(img)
+        accent = EMOTION_COLORS.get(emo, (0, 212, 255))
 
-        # 2. Trigger voice listening cycle
-        self.trigger_voice_cycle()
+        d.rectangle([(0, 0), (320, 28)], fill=(22, 28, 44))
+        d.line([(0, 28), (320, 28)], fill=(45, 55, 72), width=1)
 
-    def trigger_voice_cycle(self):
-        """Executes full Listen -> Gemini 2.5 Flash Multimodal -> Speak pipeline."""
-        if not self._voice_lock.acquire(blocking=False):
-            logger.warning("Voice cycle already in progress, ignoring duplicate trigger.")
-            return
+        if mode == "response":
+            eye_h = 8 if pulse else 12
+            d.rounded_rectangle([(8, 14 - eye_h // 2), (16, 14 + eye_h // 2)], radius=3, fill=accent)
+            d.rounded_rectangle([(20, 14 - eye_h // 2), (28, 14 + eye_h // 2)], radius=3, fill=accent)
+            d.text((36, 7), "SPEAKING" if st == "speaking" else "ANSWER", fill=accent, font=self.font_sm)
+        else:
+            d.ellipse([(10, 9), (18, 17)], fill=accent)
+            d.text((24, 7), st.upper(), fill=accent, font=self.font_sm)
+
+        d.text((140, 7), f"[{lang.upper()}]", fill=(0, 212, 255), font=self.font_sm)
+        d.text((245, 7), f"{int(dist)}cm" if dist > 0 else "-- cm", fill=(160, 174, 192), font=self.font_sm)
+
+        if mode == "response":
+            y_cursor = 34
+            if q_txt:
+                q_short = q_txt if len(q_txt) <= 42 else q_txt[:39] + "..."
+                d.rounded_rectangle([(10, y_cursor), (310, y_cursor + 22)], radius=6, fill=(18, 25, 42))
+                d.text((18, y_cursor + 4), f"Q: {q_short}", fill=(148, 163, 184), font=self.font_xs)
+                y_cursor += 28
+
+            d.rounded_rectangle([(10, y_cursor), (310, 232)], radius=10, fill=(22, 28, 44), outline=accent, width=2)
+            if len(txt) <= 85:
+                fnt, line_h, max_l = self.font_lg, 24, 6
+            elif len(txt) <= 155:
+                fnt, line_h, max_l = self.font_md, 20, 7
+            else:
+                fnt, line_h, max_l = self.font_sm, 17, 9
+
+            lines = self._wrap_text(d, txt, fnt, max_w=278, max_lines=max_l)
+            ty = y_cursor + 10
+            for line in lines:
+                d.text((20, ty), line, fill=(255, 255, 255), font=fnt)
+                ty += line_h
+        else:
+            h = 10 if blink else 54
+            for cx in (95, 225):
+                if emo == "happy" and not blink:
+                    d.arc([cx - 30, 65, cx + 30, 125], start=190, end=350, fill=accent, width=7)
+                else:
+                    d.rounded_rectangle([cx - 30, 92 - h // 2, cx + 30, 92 + h // 2], radius=14, fill=accent)
+                    if not blink:
+                        d.ellipse([cx + 10, 92 - h // 2 + 8, cx + 18, 92 - h // 2 + 16], fill=(255, 255, 255))
+
+            d.rounded_rectangle([(10, 160), (310, 232)], radius=8, fill=(22, 28, 44), outline=(45, 55, 72))
+            if st == "listening":
+                label = f"Hearing voice... ({rem}s)" if speech_act else f"Listening... ({rem}s)"
+                d.text((20, 172), label, fill=(72, 239, 128) if speech_act else (56, 189, 248), font=self.font_md)
+                d.rounded_rectangle([(20, 204), (300, 218)], radius=4, fill=(12, 16, 28))
+                pct = max(0.0, min(1.0, robot["listen_remaining"] / tot))
+                bar_w = int(280 * pct)
+                if bar_w > 4:
+                    bar_col = (72, 239, 128) if speech_act else ((245, 158, 11) if rem <= 2 else (0, 212, 255))
+                    d.rounded_rectangle([(20, 204), (20 + bar_w, 218)], radius=4, fill=bar_col)
+            else:
+                lines = self._wrap_text(d, txt, self.font_md, max_w=278, max_lines=3)
+                for i, line in enumerate(lines):
+                    d.text((18, 168 + i * 20), line, fill=(255, 255, 255), font=self.font_md)
+
+        self.last_image = img
+
+        if not self.mock and self.spi:
+            self._cmd(0x2A); self._dat([0, 0, 1, 0x3F])
+            self._cmd(0x2B); self._dat([0, 0, 0, 0xEF])
+            self._cmd(0x2C)
+            try:
+                import numpy as np
+                arr = np.asarray(img, dtype=np.uint16)
+                buf = (((arr[:, :, 0] & 0xF8) << 8) | ((arr[:, :, 1] & 0xFC) << 3) | (arr[:, :, 2] >> 3)).astype(">u2").tobytes()
+            except ImportError:
+                raw = img.tobytes()
+                buf = bytearray(320 * 240 * 2)
+                for i in range(320 * 240):
+                    buf[i * 2] = (raw[i * 3] & 0xF8) | (raw[i * 3 + 1] >> 5)
+                    buf[i * 2 + 1] = ((raw[i * 3 + 1] & 0x1C) << 3) | (raw[i * 3 + 2] >> 3)
+            self.GPIO.output(PIN_TFT_DC, self.GPIO.HIGH)
+            write_fn = getattr(self.spi, "writebytes2", self.spi.writebytes)
+            for off in range(0, len(buf), 4096):
+                write_fn(buf[off : off + 4096])
+
+
+# ==============================================================================
+# 6. ULTRASONIC SENSOR (10-15cm WAKE; INTERRUPTS THINKING, NEVER INTERRUPTS SPEAKING)
+# ==============================================================================
+def ultrasonic_worker():
+    if MOCK_HARDWARE:
+        robot["distance_cm"] = 120.0
+        return
+
+    try:
+        import RPi.GPIO as GPIO
+        GPIO.setmode(GPIO.BCM); GPIO.setwarnings(False)
+        GPIO.setup(PIN_TRIG, GPIO.OUT); GPIO.setup(PIN_ECHO, GPIO.IN)
+        GPIO.output(PIN_TRIG, GPIO.LOW)
+        time.sleep(0.3)
+        log.info("Ultrasonic HC-SR04 active on TRIG=GPIO%d, ECHO=GPIO%d (trigger <= %.1f cm)", PIN_TRIG, PIN_ECHO, WAKE_DISTANCE_CM)
+    except Exception as e:
+        log.warning("Ultrasonic GPIO init failed: %s", e)
+        return
+
+    no_echo_warned, valid_count = False, 0
+
+    while True:
+        # Never interrupt while already listening OR while giving a spoken response!
+        if robot["state"] in ("listening", "speaking"):
+            time.sleep(0.3)
+            continue
 
         try:
-            # Step 1: LISTENING
-            logger.info("--- Voice Cycle Started ---")
-            self.state_mgr.set_state(RobotState.LISTENING, Emotion.LISTENING)
-            self.state_mgr.record_turn(
-                user_query="",
-                reply_native="Listening...",
-                reply_english="Listening...",
-                reply_romanized="Listening...",
-                emotion="listening",
-                detected_language=self.state_mgr.active_language
-            )
+            GPIO.output(PIN_TRIG, GPIO.HIGH)
+            time.sleep(0.000012)
+            GPIO.output(PIN_TRIG, GPIO.LOW)
 
-            # Record voice from microphone (5 seconds)
-            audio_data = self.audio_svc.record_audio(duration_sec=config.RECORD_DURATION_SEC)
-            if not audio_data:
-                logger.warning("No audio data captured.")
-                self.state_mgr.set_state(RobotState.IDLE, Emotion.NEUTRAL)
+            t0 = time.perf_counter()
+            deadline = t0 + 0.035
+
+            while GPIO.input(PIN_ECHO) == 0:
+                t0 = time.perf_counter()
+                if t0 > deadline:
+                    break
+
+            t1 = t0
+            while GPIO.input(PIN_ECHO) == 1:
+                t1 = time.perf_counter()
+                if t1 > deadline:
+                    break
+
+            if t1 > t0 and t0 <= deadline:
+                dist = round(((t1 - t0) * 34300.0) / 2.0, 1)
+                if 2.0 <= dist <= 400.0:
+                    valid_count += 1
+                    if valid_count == 1:
+                        log.info("Ultrasonic first valid reading: %.1f cm", dist)
+                    with state_lock:
+                        robot["distance_cm"] = dist
+
+                    st = robot["state"]
+                    now = time.time()
+
+                    if WAKE_MIN_CM <= dist <= WAKE_DISTANCE_CM:
+                        if st == "idle" and (now - last_wake_time) >= COOLDOWN_SEC:
+                            trigger_voice_session(from_wake=True, is_interrupt=False, dist=dist)
+                        elif st == "thinking" and now >= interrupt_armed_at:
+                            trigger_voice_session(from_wake=False, is_interrupt=True, dist=dist)
+            else:
+                with state_lock:
+                    robot["distance_cm"] = -1.0
+                if not no_echo_warned and valid_count == 0:
+                    no_echo_warned = True
+                    log.warning("Ultrasonic: No ECHO on GPIO%d. Check 5V VCC & 1k/2k divider!", PIN_ECHO)
+        except Exception:
+            pass
+        time.sleep(0.25)
+
+
+def trigger_voice_session(from_wake: bool = False, is_interrupt: bool = False, dist: float = 0.0):
+    global last_wake_time, interrupt_armed_at, active_gen_id
+    now = time.time()
+    last_wake_time = now
+    interrupt_armed_at = now + 2.2
+
+    if is_interrupt:
+        interrupt_thinking(f"Ultrasonic Thinking Interrupt ({dist:.1f} cm)")
+    else:
+        with state_lock:
+            active_gen_id += 1
+        log.info("Proximity wake triggered at %.1f cm!", dist)
+
+    my_gen = active_gen_id
+    threading.Thread(target=run_voice_cycle, args=(from_wake, is_interrupt, my_gen), daemon=True).start()
+
+
+# ==============================================================================
+# 7. CONTINUOUS MULTI-TURN CONVERSATION PIPELINE
+# ==============================================================================
+def handle_reply(user_text: str, res: RobotReply, speak: bool = True, gen_id: int = 0):
+    if gen_id and gen_id != active_gen_id:
+        return
+    u_txt = user_text or res.user_transcript or "[Voice]"
+    with state_lock:
+        if gen_id and gen_id != active_gen_id:
+            return
+        robot["last_question"] = u_txt
+        robot["detected_lang"] = res.detected_language
+        robot["reply_native"] = res.reply_native
+        robot["reply_romanized"] = res.reply_romanized
+        robot["emotion"] = res.emotion
+        robot["response_hold_until"] = time.time() + RESPONSE_HOLD_SEC
+        chat_history.append({"role": "User", "text": u_txt})
+        chat_history.append({"role": "Easibot", "text": res.reply_english})
+        if len(chat_history) > 12:
+            del chat_history[:-12]
+
+    if speak and robot["speaker_on"]:
+        with state_lock:
+            if gen_id and gen_id != active_gen_id:
+                return
+            robot["state"], robot["emotion"] = "speaking", "speaking"
+        # Speak completely without ultrasonic interruption
+        speak_text(res.reply_native, res.detected_language)
+        with state_lock:
+            robot["response_hold_until"] = time.time() + RESPONSE_HOLD_SEC
+
+
+def run_voice_cycle(from_wake: bool = False, is_interrupt: bool = False, gen_id: Optional[int] = None):
+    global last_wake_time, interrupt_armed_at, active_gen_id
+    if gen_id is None:
+        with state_lock:
+            active_gen_id += 1
+            gen_id = active_gen_id
+
+    try:
+        turn = 0
+        while gen_id == active_gen_id:
+            turn += 1
+            interrupt_armed_at = time.time() + 2.2
+
+            if turn == 1 and from_wake and not is_interrupt and robot["speaker_on"]:
+                with state_lock:
+                    robot["state"], robot["emotion"] = "speaking", "happy"
+                    robot["last_question"] = ""
+                    robot["reply_native"] = "Hi! Ask me anything."
+                speak_text("Hi! Ask me anything.", "en")
+                if gen_id != active_gen_id:
+                    return
+            else:
+                play_ready_beep()
+
+            with state_lock:
+                if gen_id != active_gen_id:
+                    return
+                robot["state"], robot["emotion"] = "listening", "listening"
+                robot["response_hold_until"] = 0.0
+                robot["reply_native"] = "Listening..." if turn == 1 else "Listening for next question..."
+
+            wav = record_voice(wait_speech_sec=LISTEN_TIMEOUT_SEC, gen_id=gen_id)
+            if gen_id != active_gen_id:
                 return
 
-            # Step 2: THINKING & GEMINI PROCESSING
-            logger.info("Audio captured (%d bytes). Querying Gemini 2.5 Flash...", len(audio_data))
-            self.state_mgr.set_state(RobotState.THINKING, Emotion.THINKING)
-            self.state_mgr.record_turn(
-                user_query="[Voice Input]",
-                reply_native="Thinking...",
-                reply_english="Thinking...",
-                reply_romanized="Thinking...",
-                emotion="thinking",
-                detected_language=self.state_mgr.active_language
-            )
+            if not wav:
+                with state_lock:
+                    if gen_id == active_gen_id:
+                        robot["state"], robot["emotion"] = "idle", "happy"
+                        if turn == 1:
+                            robot["reply_native"] = "No speech heard."
+                break
 
-            # Send native audio directly to Gemini 2.5 Flash
-            result = self.gemini_svc.process_audio_query(
-                audio_bytes=audio_data,
-                mime_type="audio/wav",
-                language_preference=self.state_mgr.active_language
-            )
+            with state_lock:
+                if gen_id != active_gen_id:
+                    return
+                robot["state"], robot["emotion"] = "thinking", "thinking"
+                robot["reply_native"] = "Thinking..."
+                interrupt_armed_at = time.time() + 1.5
 
-            logger.info("Gemini reply received: lang=%s, emotion=%s", result.detected_language, result.emotion)
+            res = ask_gemini(audio_wav=wav, lang_pref=robot["language"], gen_id=gen_id)
+            if not res or gen_id != active_gen_id:
+                return
 
-            # Step 3: SPEAKING & TFT DISPLAY
-            self.state_mgr.set_state(RobotState.SPEAKING)
-            self.state_mgr.record_turn(
-                user_query="[Voice Input]",
-                reply_native=result.reply_native,
-                reply_english=result.reply_english,
-                reply_romanized=result.reply_romanized,
-                emotion=result.emotion,
-                detected_language=result.detected_language
-            )
+            if not res.user_transcript.strip() and res.end_conversation:
+                with state_lock:
+                    if gen_id == active_gen_id:
+                        robot["state"], robot["emotion"] = "idle", "happy"
+                break
 
-            # Synthesize & play speech on Bluetooth speaker
-            if self.state_mgr.speaker_enabled:
-                tts_path = self.audio_svc.synthesize_speech(
-                    text=result.reply_native,
-                    language=result.detected_language
-                )
-                if tts_path:
-                    self.audio_svc.play_audio(tts_path, blocking=True)
-            else:
-                time.sleep(2.5)
+            handle_reply(res.user_transcript, res, speak=True, gen_id=gen_id)
+            if gen_id != active_gen_id:
+                return
 
-            # Step 4: Return to IDLE
-            self.state_mgr.set_state(RobotState.IDLE, Emotion.HAPPY)
-            logger.info("--- Voice Cycle Completed Successfully ---")
+            if res.end_conversation:
+                with state_lock:
+                    if gen_id == active_gen_id:
+                        robot["state"], robot["emotion"] = "idle", "happy"
+                break
 
-        except Exception as e:
-            logger.error("Error in voice interaction cycle: %s", e)
-            self.state_mgr.set_state(RobotState.ERROR, Emotion.ERROR)
-            time.sleep(2.0)
-            self.state_mgr.set_state(RobotState.IDLE, Emotion.NEUTRAL)
-        finally:
-            self._voice_lock.release()
-
-    def stop(self):
-        """Gracefully tears down all services."""
-        logger.info("Shutting down Easibot services...")
-        self._running = False
-        self.ultrasonic.stop()
-        self.tft.stop_animation_loop()
-        self.audio_svc.stop_playback()
-        logger.info("Easibot shutdown complete.")
+        if gen_id == active_gen_id:
+            last_wake_time = time.time()
+    finally:
+        with state_lock:
+            if gen_id == active_gen_id and robot["state"] in ("listening", "thinking", "speaking"):
+                robot["state"], robot["emotion"] = "idle", "happy"
 
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Easibot Multilingual Robot Assistant")
-    parser.add_argument("--mock", action="store_true", help="Force mock hardware mode (laptop development)")
-    parser.add_argument("--hardware", action="store_true", help="Force physical Raspberry Pi hardware mode")
-    parser.add_argument("--port", type=int, default=config.WEB_PORT, help="Flask web port (default: 5000)")
-    parser.add_argument("--lang", type=str, default=config.DEFAULT_LANGUAGE, choices=["auto", "en", "te", "hi"], help="Default language")
-    return parser.parse_args()
+# ==============================================================================
+# 8. MAIN ENTRY POINT (HEADLESS)
+# ==============================================================================
+if __name__ == "__main__":
+    log.info(
+        "Starting Easibot Headless (Model=%s, MOCK=%s, TRIG=GPIO%d, ECHO=GPIO%d, Wake=%.1f-%.1fcm)...",
+        GEMINI_MODEL, MOCK_HARDWARE, PIN_TRIG, PIN_ECHO, WAKE_MIN_CM, WAKE_DISTANCE_CM
+    )
 
+    tft = SimpleTFT()
+    tft.render_and_push(force=True)
+    threading.Thread(target=ultrasonic_worker, daemon=True).start()
 
-def main():
-    args = parse_args()
-
-    mock_mode = config.MOCK_HARDWARE
-    if args.mock:
-        mock_mode = True
-    elif args.hardware:
-        mock_mode = False
-
-    if args.port:
-        config.WEB_PORT = args.port
-    if args.lang:
-        config.DEFAULT_LANGUAGE = args.lang
-
-    bot = EasibotApp(mock_hardware=mock_mode)
-
-    # Signal handlers for clean exit
-    def sig_handler(sig, frame):
-        logger.info("Received termination signal. Exiting cleanly...")
-        bot.stop()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, sig_handler)
-    signal.signal(signal.SIGTERM, sig_handler)
-
-    bot.start()
-
-    # Keep main thread alive
     try:
         while True:
-            time.sleep(1.0)
+            tft.render_and_push()
+            time.sleep(0.25)
     except KeyboardInterrupt:
-        bot.stop()
-
-
-if __name__ == "__main__":
-    main()
+        log.info("Easibot stopped.")

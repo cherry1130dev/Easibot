@@ -1,5 +1,5 @@
 # ==============================================================================
-# Easibot: Core & Development Dependencies
+# Easibot: Minimal Dependencies (Raspberry Pi Zero W / Zero 2 W)
 # ==============================================================================
 
 # Multilingual AI Engine (Google GenAI SDK)
@@ -17,15 +17,3 @@ numpy>=2.0.0
 
 # Display Rendering & Graphics
 pillow>=11.0.0
-
-# Web Dashboard
-flask>=3.0.0
-
-# ==============================================================================
-# Hardware Dependencies (Raspberry Pi Zero 2 W only)
-# (Install via scripts/setup_rpi.sh on Raspberry Pi OS)
-# ==============================================================================
-# gpiozero>=2.0
-# RPi.GPIO>=0.7.1
-# adafruit-circuitpython-rgb-display>=3.10.0
-# spidev>=3.6
