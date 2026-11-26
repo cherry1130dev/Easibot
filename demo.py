@@ -64,6 +64,8 @@ LISTEN_TIMEOUT_SEC = float(os.getenv("LISTEN_TIMEOUT_SEC", "8.0"))
 MAX_RECORD_SEC = float(os.getenv("RECORD_DURATION_SEC", "12.0"))
 MAX_LISTEN_RETRIES = int(os.getenv("LISTEN_RETRIES", "1"))
 RESPONSE_HOLD_SEC = 8.0
+AUTO_UPDATE = os.getenv("AUTO_UPDATE", "false" if MOCK_HARDWARE else "true").lower() in ("1", "true", "yes")
+AUTO_UPDATE_INTERVAL_SEC = int(os.getenv("AUTO_UPDATE_INTERVAL_SEC", "60"))
 
 TEMP_DIR = BASE_DIR / "temp_audio"
 TEMP_DIR.mkdir(exist_ok=True)
@@ -1099,14 +1101,51 @@ def run_voice_cycle(from_wake: bool = False, is_interrupt: bool = False, gen_id:
 
 
 # ==============================================================================
-# 8. MAIN ENTRY POINT
+# 8. GITHUB AUTO-UPDATE & MAIN ENTRY POINT
 # ==============================================================================
+def check_and_apply_git_update() -> bool:
+    """Checks origin/main for new commits; if found, pulls and returns True."""
+    if not (BASE_DIR / ".git").exists() or not shutil.which("git"):
+        return False
+    try:
+        subprocess.run(
+            ["git", "fetch", "origin", "main"],
+            cwd=str(BASE_DIR), timeout=15, check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        local_sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=str(BASE_DIR), text=True, stderr=subprocess.DEVNULL).strip()
+        remote_sha = subprocess.check_output(["git", "rev-parse", "origin/main"], cwd=str(BASE_DIR), text=True, stderr=subprocess.DEVNULL).strip()
+        if local_sha and remote_sha and local_sha != remote_sha:
+            log.info("🔄 New update on GitHub (%s -> %s)! Pulling latest code...", local_sha[:7], remote_sha[:7])
+            with state_lock:
+                robot["reply_native"] = "Updating software..."
+            subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=str(BASE_DIR), check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return True
+    except Exception as e:
+        log.debug("Auto-update check skipped: %s", e)
+    return False
+
+
+def auto_update_worker():
+    """Periodically checks GitHub when idle and restarts automatically if updated."""
+    if not AUTO_UPDATE:
+        return
+    log.info("GitHub Auto-Update watcher enabled (every %ds)", AUTO_UPDATE_INTERVAL_SEC)
+    while True:
+        time.sleep(AUTO_UPDATE_INTERVAL_SEC)
+        if robot["state"] == "idle" and check_and_apply_git_update():
+            log.info("🚀 Restarting Easibot with updated code...")
+            time.sleep(0.5)
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
 if __name__ == "__main__":
     log.info("Starting Easibot Fast Edition (Model=%s, MOCK=%s, TRIG=GPIO%d, ECHO=GPIO%d)...", GEMINI_MODEL, MOCK_HARDWARE, PIN_TRIG, PIN_ECHO)
 
     tft_instance = SimpleTFT()
     tft_instance.render_and_push(force=True)
     threading.Thread(target=ultrasonic_worker, daemon=True).start()
+    threading.Thread(target=auto_update_worker, daemon=True).start()
 
     try:
         while True:
