@@ -57,8 +57,8 @@ PIN_TFT_DC = 24
 PIN_TFT_RST = 25
 PIN_TFT_LED = 18
 
-WAKE_DISTANCE_CM = float(os.getenv("WAKE_DISTANCE_CM", "60.0"))
-INTERRUPT_DISTANCE_CM = float(os.getenv("INTERRUPT_DISTANCE_CM", "35.0"))
+WAKE_MIN_CM = float(os.getenv("WAKE_MIN_CM", "5.0"))
+WAKE_DISTANCE_CM = float(os.getenv("WAKE_DISTANCE_CM", "15.0"))
 COOLDOWN_SEC = float(os.getenv("ULTRASONIC_COOLDOWN_SEC", "15.0"))
 LISTEN_TIMEOUT_SEC = float(os.getenv("LISTEN_TIMEOUT_SEC", "5.0"))
 MAX_RECORD_SEC = float(os.getenv("RECORD_DURATION_SEC", "7.0"))
@@ -864,23 +864,30 @@ def ultrasonic_worker():
     try:
         import RPi.GPIO as GPIO
         GPIO.setmode(GPIO.BCM); GPIO.setwarnings(False)
-        GPIO.setup(PIN_TRIG, GPIO.OUT); GPIO.setup(PIN_ECHO, GPIO.IN)
+        GPIO.setup(PIN_TRIG, GPIO.OUT)
+        GPIO.setup(PIN_ECHO, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
         GPIO.output(PIN_TRIG, GPIO.LOW)
         time.sleep(0.3)
-        log.info("Ultrasonic HC-SR04 active on TRIG=GPIO%d, ECHO=GPIO%d", PIN_TRIG, PIN_ECHO)
+        log.info("Ultrasonic HC-SR04 active on TRIG=GPIO%d, ECHO=GPIO%d (trigger %.1f-%.1f cm, 3-hit confirm)", PIN_TRIG, PIN_ECHO, WAKE_MIN_CM, WAKE_DISTANCE_CM)
     except Exception as e:
         log.warning("Ultrasonic GPIO init failed: %s", e)
         return
 
-    no_echo_warned, valid_count = False, 0
-    prev_dist = 999.0
+    no_echo_warned, valid_count, hit_streak = False, 0, 0
 
     while True:
-        if robot["state"] == "listening":
-            time.sleep(0.35)
+        # Never interrupt while listening OR giving a spoken response!
+        if robot["state"] in ("listening", "speaking"):
+            hit_streak = 0
+            time.sleep(0.3)
             continue
 
         try:
+            if GPIO.input(PIN_ECHO) == 1:
+                hit_streak = 0
+                time.sleep(0.15)
+                continue
+
             GPIO.output(PIN_TRIG, GPIO.HIGH)
             time.sleep(0.000012)
             GPIO.output(PIN_TRIG, GPIO.LOW)
@@ -911,22 +918,29 @@ def ultrasonic_worker():
                     st = robot["state"]
                     now = time.time()
 
-                    if st == "idle" and dist <= WAKE_DISTANCE_CM and (now - last_wake_time) >= COOLDOWN_SEC:
-                        trigger_voice_session(from_wake=True, is_interrupt=False, dist=dist)
-                    elif st in ("thinking", "speaking") and now >= interrupt_armed_at:
-                        if dist <= INTERRUPT_DISTANCE_CM or (prev_dist > WAKE_DISTANCE_CM and dist <= WAKE_DISTANCE_CM):
-                            trigger_voice_session(from_wake=False, is_interrupt=True, dist=dist)
-
-                    prev_dist = dist
+                    if WAKE_MIN_CM <= dist <= WAKE_DISTANCE_CM:
+                        hit_streak += 1
+                        if hit_streak >= 3:
+                            if st == "idle" and (now - last_wake_time) >= COOLDOWN_SEC:
+                                hit_streak = 0
+                                trigger_voice_session(from_wake=True, is_interrupt=False, dist=dist)
+                            elif st == "thinking" and now >= interrupt_armed_at:
+                                hit_streak = 0
+                                trigger_voice_session(from_wake=False, is_interrupt=True, dist=dist)
+                    else:
+                        hit_streak = 0
+                else:
+                    hit_streak = 0
             else:
+                hit_streak = 0
                 with state_lock:
                     robot["distance_cm"] = -1.0
                 if not no_echo_warned and valid_count == 0:
                     no_echo_warned = True
                     log.warning("Ultrasonic: No ECHO on GPIO%d. Check 5V VCC & 1k/2k divider!", PIN_ECHO)
         except Exception:
-            pass
-        time.sleep(0.28)
+            hit_streak = 0
+        time.sleep(0.2)
 
 
 def trigger_voice_session(from_wake: bool = False, is_interrupt: bool = False, dist: float = 0.0):
