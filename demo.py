@@ -88,8 +88,8 @@ robot = {
     "speaker_on": True,
     "continuous_chat": True,
     "last_question": "",
-    "reply_native": "Hello! I am Easibot. Ready!",
-    "reply_romanized": "Hello! I am Easibot. Ready!",
+    "reply_native": "Easibot v2.0 (Auto-Updated!)",
+    "reply_romanized": "Easibot v2.0 (Auto-Updated!)",
     "response_hold_until": 0.0,
     "listen_remaining": 0.0,
     "listen_total": LISTEN_TIMEOUT_SEC,
@@ -1140,7 +1140,7 @@ def auto_update_worker():
 
 
 if __name__ == "__main__":
-    log.info("Starting Easibot Fast Edition (Model=%s, MOCK=%s, TRIG=GPIO%d, ECHO=GPIO%d)...", GEMINI_MODEL, MOCK_HARDWARE, PIN_TRIG, PIN_ECHO)
+    log.info("=== Easibot v2.0 AUTO-UPDATE VERIFIED! === (Model=%s, MOCK=%s, TRIG=GPIO%d, ECHO=GPIO%d)", GEMINI_MODEL, MOCK_HARDWARE, PIN_TRIG, PIN_ECHO)
 
     tft_instance = SimpleTFT()
     tft_instance.render_and_push(force=True)
