@@ -155,28 +155,29 @@ class ILI9341DirectSPI:
         w, h = img.size
         self.set_window(0, 0, w - 1, h - 1)
 
-        # Fast RGB888 -> RGB565 conversion
         rgb_img = img.convert("RGB")
-        raw = rgb_img.tobytes()
-
-        # Build 16-bit big-endian RGB565 byte buffer
-        # In python: convert in C or fast bytearray
-        num_pixels = w * h
-        buf = bytearray(num_pixels * 2)
-
-        for i in range(num_pixels):
-            r = raw[i * 3]
-            g = raw[i * 3 + 1]
-            b = raw[i * 3 + 2]
-            # 5 bits R, 6 bits G, 5 bits B
-            buf[i * 2] = (r & 0xF8) | (g >> 5)
-            buf[i * 2 + 1] = ((g & 0x1C) << 3) | (b >> 3)
+        try:
+            import numpy as np
+            arr = np.asarray(rgb_img, dtype=np.uint16)
+            color = ((arr[:, :, 0] & 0xF8) << 8) | ((arr[:, :, 1] & 0xFC) << 3) | (arr[:, :, 2] >> 3)
+            buf = color.astype(">u2").tobytes()
+        except ImportError:
+            raw = rgb_img.tobytes()
+            num_pixels = w * h
+            buf = bytearray(num_pixels * 2)
+            for i in range(num_pixels):
+                r = raw[i * 3]
+                g = raw[i * 3 + 1]
+                b = raw[i * 3 + 2]
+                buf[i * 2] = (r & 0xF8) | (g >> 5)
+                buf[i * 2 + 1] = ((g & 0x1C) << 3) | (b >> 3)
 
         # Transmit in 4096-byte chunks
         GPIO.output(self.dc_pin, GPIO.HIGH)
+        write_fn = getattr(self.spi, "writebytes2", self.spi.writebytes)
         chunk = 4096
         for offset in range(0, len(buf), chunk):
-            self.spi.writebytes(buf[offset : offset + chunk])
+            write_fn(buf[offset : offset + chunk])
 
     def close(self):
         try:
