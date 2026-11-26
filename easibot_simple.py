@@ -48,8 +48,8 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 MOCK_HARDWARE = os.getenv("MOCK_HARDWARE", "false" if sys.platform.startswith("linux") else "true").lower() in ("1", "true", "yes")
 
 # GPIO Pins (BCM)
-PIN_TRIG = 23          # HC-SR04 TRIG (Pin 16)
-PIN_ECHO = 27          # HC-SR04 ECHO (Pin 13 via 1k/2k voltage divider)
+PIN_TRIG = int(os.getenv("PIN_TRIG", "23"))   # Default GPIO 23 (Pin 16) - can set PIN_TRIG=13 in .env
+PIN_ECHO = int(os.getenv("PIN_ECHO", "27"))   # Default GPIO 27 (Pin 13) - can set PIN_ECHO=16 in .env
 PIN_TFT_DC = 24        # TFT DC/RS (Pin 18)
 PIN_TFT_RST = 25       # TFT RESET (Pin 22)
 PIN_TFT_LED = 18       # TFT Backlight (Pin 12)

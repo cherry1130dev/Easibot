@@ -91,8 +91,8 @@ EMOTION_COLORS = {
 #   TRIG -> GPIO 23 (Pin 16)
 #   ECHO -> GPIO 27 (Pin 13) (via 1k / 2k ohm voltage divider to protect 3.3V Pi pin)
 # ==============================================================================
-PIN_TRIG = 23
-PIN_ECHO = 27
+PIN_TRIG = int(os.getenv("PIN_TRIG", "23"))
+PIN_ECHO = int(os.getenv("PIN_ECHO", "27"))
 
 # Proximity trigger threshold
 WAKE_DISTANCE_CM = float(os.getenv("WAKE_DISTANCE_CM", "60.0"))
