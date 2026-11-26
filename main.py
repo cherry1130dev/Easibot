@@ -734,7 +734,8 @@ class SimpleTFT:
         mode = "response" if hold_resp else "face"
         blink = 1 if (mode == "face" and self.tick % 12 == 0 and st == "idle") else 0
         pulse = (self.tick % 2) if st == "speaking" else 0
-        sig = (mode, st, emo, txt, q_txt, int(dist // 4) if dist > 0 else -1, lang, blink, pulse, rem, speech_act)
+        clock_str = time.strftime("%I:%M %p · %d %b").lstrip("0")
+        sig = (mode, st, emo, txt, q_txt, int(dist // 4) if dist > 0 else -1, lang, blink, pulse, rem, speech_act, clock_str)
 
         if not force and sig == self._last_signature:
             return
@@ -744,20 +745,34 @@ class SimpleTFT:
         d = ImageDraw.Draw(img)
         accent = EMOTION_COLORS.get(emo, (0, 212, 255))
 
+        # Mobile-UI Top Status Bar (Status | Time & Date | Lang + Distance)
         d.rectangle([(0, 0), (320, 28)], fill=(22, 28, 44))
         d.line([(0, 28), (320, 28)], fill=(45, 55, 72), width=1)
 
         if mode == "response":
             eye_h = 8 if pulse else 12
-            d.rounded_rectangle([(8, 14 - eye_h // 2), (16, 14 + eye_h // 2)], radius=3, fill=accent)
-            d.rounded_rectangle([(20, 14 - eye_h // 2), (28, 14 + eye_h // 2)], radius=3, fill=accent)
-            d.text((36, 7), "SPEAKING" if st == "speaking" else "ANSWER", fill=accent, font=self.font_sm)
+            d.rounded_rectangle([(8, 14 - eye_h // 2), (15, 14 + eye_h // 2)], radius=2, fill=accent)
+            d.rounded_rectangle([(18, 14 - eye_h // 2), (25, 14 + eye_h // 2)], radius=2, fill=accent)
+            d.text((30, 8), "SPEAK" if st == "speaking" else "ANS", fill=accent, font=self.font_xs)
         else:
-            d.ellipse([(10, 9), (18, 17)], fill=accent)
-            d.text((24, 7), st.upper(), fill=accent, font=self.font_sm)
+            short_st = {"idle": "READY", "listening": "LISTEN", "thinking": "THINK"}.get(st, st.upper())
+            d.ellipse([(8, 10), (15, 17)], fill=accent)
+            d.text((20, 8), short_st, fill=accent, font=self.font_xs)
 
-        d.text((140, 7), f"[{lang.upper()}]", fill=(0, 212, 255), font=self.font_sm)
-        d.text((245, 7), f"{int(dist)}cm" if dist > 0 else "-- cm", fill=(160, 174, 192), font=self.font_sm)
+        # Centered Mobile Time & Date
+        try:
+            cw = d.textbbox((0, 0), clock_str, font=self.font_xs)[2]
+        except Exception:
+            cw = len(clock_str) * 6
+        d.text(((320 - cw) // 2 + 4, 8), clock_str, fill=(241, 245, 249), font=self.font_xs)
+
+        # Right-aligned Language + Proximity
+        right_str = f"[{lang.upper()}] {int(dist)}cm" if dist > 0 else f"[{lang.upper()}]"
+        try:
+            rw = d.textbbox((0, 0), right_str, font=self.font_xs)[2]
+        except Exception:
+            rw = len(right_str) * 6
+        d.text((312 - rw, 8), right_str, fill=(0, 212, 255), font=self.font_xs)
 
         if mode == "response":
             y_cursor = 34
