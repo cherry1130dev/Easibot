@@ -29,7 +29,7 @@ MOCK_HARDWARE = os.getenv("MOCK_HARDWARE", "true").lower() in ("true", "1", "yes
 # Google Gemini AI Settings
 # ==============================================================================
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 # Default language preference: 'auto', 'en', 'te', or 'hi'
 DEFAULT_LANGUAGE = os.getenv("DEFAULT_LANGUAGE", "auto").lower()

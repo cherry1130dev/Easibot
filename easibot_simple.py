@@ -1,14 +1,15 @@
 """
-Easibot Simple Edition - Single-File AI Multilingual Assistant Robot
-===================================================================
-Supports Raspberry Pi Zero W / Zero 2 W & Laptop Mock Mode.
+Easibot Simple Edition - Fast Single-File AI Multilingual Assistant Robot
+========================================================================
+Optimized for Raspberry Pi Zero W / Zero 2 W & Laptop Mock Mode.
 Features:
-  - Google Gemini AI (English, Telugu, Hindi + Native Audio Recognition)
-  - Auto-Switching Audio: USB Mic / Bluetooth Neckband (Zebronics) / Laptop Mic
-  - Auto-Switching Output: Bluetooth Speaker / USB / HDMI via edge-tts & gTTS
-  - Fast NumPy ILI9341 2.8" SPI TFT LCD Display with Animated Robot Eyes
-  - HC-SR04 Ultrasonic Proximity Wake-Up (60cm threshold, 15s cooldown)
-  - Embedded Lightweight Flask Web Dashboard on Port 5000
+  - Ultra-Fast Gemini 3.5 Flash-Lite (1-2s replies, English/Telugu/Hindi + Audio)
+  - Continuous Multi-Turn Voice Chat (remembers context, auto-listens for follow-ups!)
+  - Smart VAD Voice Recorder (stops 1s after you finish speaking; auto-exits on silence)
+  - Auto-Switching Audio: USB Mic / Zebronics Bluetooth Neckband / Laptop Mic
+  - Fast NumPy ILI9341 2.8" SPI TFT LCD (dirty-frame caching = minimal CPU lag)
+  - HC-SR04 Ultrasonic Proximity Wake-Up (configurable via PIN_TRIG / PIN_ECHO in .env)
+  - Embedded Flask Web Dashboard on Port 5000
 
 Run:
   python easibot_simple.py
@@ -16,18 +17,20 @@ Run:
 
 import os
 import re
+import io
 import sys
 import json
 import time
 import wave
 import math
+import array
 import shutil
 import asyncio
 import logging
 import subprocess
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Literal
 
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify, render_template_string
@@ -44,19 +47,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger("easibot")
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 MOCK_HARDWARE = os.getenv("MOCK_HARDWARE", "false" if sys.platform.startswith("linux") else "true").lower() in ("1", "true", "yes")
 
-# GPIO Pins (BCM)
-PIN_TRIG = int(os.getenv("PIN_TRIG", "23"))   # Default GPIO 23 (Pin 16) - can set PIN_TRIG=13 in .env
-PIN_ECHO = int(os.getenv("PIN_ECHO", "27"))   # Default GPIO 27 (Pin 13) - can set PIN_ECHO=16 in .env
-PIN_TFT_DC = 24        # TFT DC/RS (Pin 18)
-PIN_TFT_RST = 25       # TFT RESET (Pin 22)
-PIN_TFT_LED = 18       # TFT Backlight (Pin 12)
+# GPIO Pins (BCM) - customizable in .env
+PIN_TRIG = int(os.getenv("PIN_TRIG", "23"))   # Default GPIO 23 (Pin 16)
+PIN_ECHO = int(os.getenv("PIN_ECHO", "27"))   # Default GPIO 27 (Pin 13)
+PIN_TFT_DC = 24
+PIN_TFT_RST = 25
+PIN_TFT_LED = 18
 
 WAKE_DISTANCE_CM = float(os.getenv("WAKE_DISTANCE_CM", "60.0"))
 COOLDOWN_SEC = float(os.getenv("ULTRASONIC_COOLDOWN_SEC", "15.0"))
-RECORD_SEC = float(os.getenv("RECORD_DURATION_SEC", "5.0"))
+MAX_RECORD_SEC = float(os.getenv("RECORD_DURATION_SEC", "7.0"))
 WEB_PORT = int(os.getenv("WEB_PORT", "5000"))
 
 TEMP_DIR = BASE_DIR / "temp_audio"
@@ -72,38 +75,43 @@ EMOTION_COLORS = {
 # Global Thread-Safe Robot State
 state_lock = threading.Lock()
 robot = {
-    "state": "idle",          # idle, listening, thinking, speaking, error
+    "state": "idle",
     "emotion": "happy",
     "language": os.getenv("DEFAULT_LANGUAGE", "auto"),
     "detected_lang": "en",
     "distance_cm": -1.0,
     "speaker_on": True,
+    "continuous_chat": True,
     "reply_native": "Hello! I am Easibot. Ready!",
     "reply_romanized": "Hello! I am Easibot. Ready!",
     "mic_info": "Detecting...",
     "speaker_info": "Detecting...",
     "messages": [],
 }
+chat_history = []  # Last 8 turns for follow-up context (e.g. mitochondria -> follow-up)
 last_wake_time = 0.0
 voice_busy_lock = threading.Lock()
 
 
 # ==============================================================================
-# 2. MULTILINGUAL AI ENGINE (GOOGLE GEMINI)
+# 2. FAST MULTILINGUAL AI ENGINE (GEMINI 3.5 FLASH-LITE + CONTEXT MEMORY)
 # ==============================================================================
 class RobotReply(BaseModel):
-    detected_language: str = Field(description="'en', 'te', or 'hi'")
-    reply_native: str = Field(description="Reply in native script (Telugu/Hindi/English)")
-    reply_english: str = Field(description="English translation")
-    reply_romanized: str = Field(description="Latin/English phonetic transliteration")
-    emotion: str = Field(description="'happy', 'thinking', 'listening', 'speaking', or 'neutral'")
+    detected_language: Literal["en", "te", "hi"] = Field(description="'en', 'te', or 'hi'")
+    user_transcript: str = Field(description="Short summary/transcript of what the user asked")
+    reply_native: str = Field(description="Concise 1-2 sentence reply in native script (Telugu/Hindi/English)")
+    reply_english: str = Field(description="English translation of reply_native")
+    reply_romanized: str = Field(description="Latin/English phonetic transliteration for TFT screen")
+    emotion: Literal["happy", "thinking", "listening", "speaking", "neutral"] = Field(description="Robot expression")
+    end_conversation: bool = Field(description="True ONLY if user says bye/stop/goodbye/no more questions")
 
 
 SYSTEM_PROMPT = (
-    "You are Easibot, a friendly multilingual robot assistant on a Raspberry Pi. "
+    "You are Easibot, a fast, friendly multilingual robot assistant on a Raspberry Pi. "
     "Understand English (en), Telugu (te), Hindi (hi), and code-mixed speech. "
-    "Keep answers short (1-2 clear sentences for a tiny 320x240 screen and quick voice TTS). "
-    "Always return JSON with detected_language, reply_native, reply_english, reply_romanized, and emotion."
+    "Use the conversation history to answer follow-up questions naturally. "
+    "Keep replies crisp and short (1-2 clear sentences) for fast voice TTS and a small 320x240 screen. "
+    "If the audio is just silence or background noise with no speech, set user_transcript='' and end_conversation=true."
 )
 
 genai_client = None
@@ -112,105 +120,120 @@ if GEMINI_API_KEY and GEMINI_API_KEY != "your_gemini_api_key_here":
         from google import genai
         from google.genai import types
         genai_client = genai.Client(api_key=GEMINI_API_KEY)
-        log.info("Gemini AI client ready (model: %s)", GEMINI_MODEL)
+        log.info("Gemini AI client ready (primary model: %s)", GEMINI_MODEL)
     except Exception as e:
         log.warning("Gemini init failed: %s", e)
 
 
+def _normalize_lang(lang: str) -> str:
+    l = (lang or "en").lower().strip()
+    if l.startswith("te"):
+        return "te"
+    if l.startswith("hi"):
+        return "hi"
+    return "en"
+
+
 def ask_gemini(text_query: Optional[str] = None, audio_wav: Optional[bytes] = None, lang_pref: str = "auto") -> RobotReply:
-    """Queries Gemini 3.5 Flash with either text or raw .wav audio bytes."""
+    """Queries fast Gemini Flash-Lite with conversation history and text or raw .wav audio."""
     if not genai_client:
         return RobotReply(
-            detected_language="en", reply_native="API Key not set. Ready in offline mode!",
-            reply_english="API Key not set.", reply_romanized="API Key not set.", emotion="neutral"
+            detected_language="en", user_transcript=text_query or "",
+            reply_native="API Key not set. Ready in offline mode!",
+            reply_english="API Key not set.", reply_romanized="API Key not set.",
+            emotion="neutral", end_conversation=False
         )
 
     instr = SYSTEM_PROMPT
     if lang_pref in ("en", "te", "hi"):
         instr += f" IMPORTANT: Reply strictly in language '{lang_pref}'."
 
+    # Include last 6 turns of conversation memory for natural follow-up questions
+    with state_lock:
+        hist_lines = [f"{h['role']}: {h['text']}" for h in chat_history[-6:]]
+    history_ctx = ("Recent conversation:\n" + "\n".join(hist_lines) + "\n\n") if hist_lines else ""
+
     cfg = types.GenerateContentConfig(
         system_instruction=instr,
         response_mime_type="application/json",
         response_schema=RobotReply,
-        temperature=0.7,
+        temperature=0.6,
     )
 
     if audio_wav:
         contents = [
             types.Part.from_bytes(data=audio_wav, mime_type="audio/wav"),
-            "Listen to this audio, understand English/Telugu/Hindi, and reply."
+            f"{history_ctx}Listen to the user's audio above, transcribe it, and answer naturally."
         ]
     else:
-        contents = f"User: {text_query}"
+        contents = f"{history_ctx}User: {text_query}"
 
-    models = [GEMINI_MODEL, "gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3.8-flash"]
+    models = [GEMINI_MODEL, "gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.5-flash"]
     for m in dict.fromkeys(models):
         try:
+            t0 = time.time()
             resp = genai_client.models.generate_content(model=m, contents=contents, config=cfg)
+            log.info("Gemini (%s) replied in %.2fs", m, time.time() - t0)
             if getattr(resp, "parsed", None):
-                return resp.parsed if isinstance(resp.parsed, RobotReply) else RobotReply(**resp.parsed)
-            raw = (resp.text or "{}").strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-            return RobotReply(**json.loads(raw))
+                res = resp.parsed if isinstance(resp.parsed, RobotReply) else RobotReply(**resp.parsed)
+            else:
+                raw = (resp.text or "{}").strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+                res = RobotReply(**json.loads(raw))
+            res.detected_language = _normalize_lang(res.detected_language)
+            return res
         except Exception as e:
             log.warning("Gemini model %s failed: %s", m, e)
 
     return RobotReply(
-        detected_language="en", reply_native="Sorry, I could not reach Gemini right now.",
+        detected_language="en", user_transcript=text_query or "",
+        reply_native="Sorry, I could not reach Gemini right now.",
         reply_english="Sorry, I could not reach Gemini right now.",
-        reply_romanized="Sorry, I could not reach Gemini right now.", emotion="error"
+        reply_romanized="Sorry, I could not reach Gemini right now.",
+        emotion="neutral", end_conversation=False
     )
 
 
 # ==============================================================================
-# 3. SMART AUTO-SWITCHING AUDIO (USB MIC / BLUETOOTH NECKBAND / FALLBACKS)
+# 3. SMART AUDIO: AUTO-DETECT USB MIC / BLUETOOTH NECKBAND + FAST VAD RECORDING
 # ==============================================================================
+_cached_mic_mode = None  # Cache detected mic for instant zero-lag follow-up listening!
+
+
 def _find_usb_alsa_mic() -> Optional[str]:
     """Finds USB microphone card via 'arecord -l' -> returns 'plughw:X,Y'."""
     if not shutil.which("arecord"):
         return None
     try:
         out = subprocess.check_output(["arecord", "-l"], text=True, stderr=subprocess.DEVNULL)
-        usb_cards = []
-        any_cards = []
+        usb_cards, any_cards = [], []
         for line in out.splitlines():
             m = re.match(r"card (\d+):.*device (\d+):", line)
             if m:
                 dev_str = f"plughw:{m.group(1)},{m.group(2)}"
-                any_cards.append((dev_str, line))
+                any_cards.append(dev_str)
                 if any(k in line.lower() for k in ("usb", "pnp", "mic", "webcam", "audio")):
-                    usb_cards.append((dev_str, line))
-        if usb_cards:
-            log.info("Detected USB Mic: %s (%s)", usb_cards[0][0], usb_cards[0][1].strip())
-            return usb_cards[0][0]
-        if any_cards:
-            log.info("Detected ALSA Mic: %s", any_cards[0][0])
-            return any_cards[0][0]
+                    usb_cards.append(dev_str)
+        return usb_cards[0] if usb_cards else (any_cards[0] if any_cards else None)
     except Exception:
-        pass
-    return None
+        return None
 
 
 def _find_bluetooth_source() -> Optional[str]:
-    """Checks PipeWire/PulseAudio for an active Bluetooth mic (e.g., Zebronics neckband)."""
+    """Checks PipeWire/PulseAudio for Bluetooth mic (e.g. Zebronics neckband)."""
     if not shutil.which("pactl"):
         return None
     try:
-        # Ensure Bluetooth headset profile is activated if no USB mic exists and BT card is in a2dp
+        sources = subprocess.check_output(["pactl", "list", "short", "sources"], text=True, stderr=subprocess.DEVNULL)
+        for s in sources.splitlines():
+            if ("bluez_input" in s or "bluez_source" in s) and "monitor" not in s:
+                return s.split()[1]
         cards = subprocess.check_output(["pactl", "list", "cards", "short"], text=True, stderr=subprocess.DEVNULL)
         for line in cards.splitlines():
             if "bluez_card" in line:
                 card_name = line.split()[1]
-                # Check if a bluez input source already exists
-                sources = subprocess.check_output(["pactl", "list", "short", "sources"], text=True, stderr=subprocess.DEVNULL)
-                for s in sources.splitlines():
-                    if "bluez_input" in s or ("bluez_source" in s and "monitor" not in s):
-                        return s.split()[1]
-                # Try switching Zebronics neckband to HFP/HSP headset profile so its mic becomes active
                 for prof in ("headset-head-unit", "headset-head-unit-msbc", "headset-head-unit-cvsd", "handsfree_head_unit"):
-                    r = subprocess.run(["pactl", "set-card-profile", card_name, prof], stderr=subprocess.DEVNULL)
-                    if r.returncode == 0:
-                        time.sleep(1.0)
+                    if subprocess.run(["pactl", "set-card-profile", card_name, prof], stderr=subprocess.DEVNULL).returncode == 0:
+                        time.sleep(0.8)
                         sources = subprocess.check_output(["pactl", "list", "short", "sources"], text=True, stderr=subprocess.DEVNULL)
                         for s in sources.splitlines():
                             if "bluez" in s and "monitor" not in s:
@@ -220,57 +243,155 @@ def _find_bluetooth_source() -> Optional[str]:
     return None
 
 
-def record_voice(duration: float = RECORD_SEC) -> Optional[bytes]:
-    """Records 16kHz mono WAV using whichever mic is available: USB Mic -> Bluetooth Neckband -> Default."""
-    wav_path = TEMP_DIR / f"rec_{int(time.time()*1000)}.wav"
+def _chunk_rms(pcm_bytes: bytes) -> float:
+    """Fast RMS audio energy calculation on 16-bit signed PCM bytes."""
+    if len(pcm_bytes) < 2:
+        return 0.0
+    samples = array.array("h")
+    samples.frombytes(pcm_bytes[: len(pcm_bytes) - (len(pcm_bytes) % 2)])
+    if not samples:
+        return 0.0
+    return math.sqrt(sum(s * s for s in samples) / len(samples))
+
+
+def _record_raw_stream_vad(cmd: list, wait_speech_sec: float = 4.0, max_sec: float = MAX_RECORD_SEC) -> Optional[bytes]:
+    """
+    Streams raw 16kHz mono PCM from arecord/parecord and stops 1.0s after user stops speaking!
+    Returns WAV bytes if speech was detected, or None if user stayed silent.
+    """
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    chunk_bytes = 6400  # 0.2 seconds at 16000Hz * 2 bytes
+    noise_samples = []
+    recorded_chunks = []
+    speech_started = False
+    silence_chunks = 0
+    max_chunks = int(max_sec / 0.2)
+    wait_chunks = int(wait_speech_sec / 0.2)
+    threshold = 350.0
+
     try:
-        # Priority 1: Physical USB Microphone via ALSA (highest voice clarity, leaves Bluetooth free for A2DP output!)
+        for idx in range(max_chunks):
+            data = proc.stdout.read(chunk_bytes)
+            if not data:
+                break
+            rms = _chunk_rms(data)
+
+            # Calibrate background noise in first 0.4s
+            if idx < 2:
+                noise_samples.append(rms)
+                recorded_chunks.append(data)
+                threshold = max(250.0, (sum(noise_samples) / len(noise_samples)) * 2.3)
+                continue
+
+            recorded_chunks.append(data)
+
+            if rms > threshold:
+                speech_started = True
+                silence_chunks = 0
+            elif speech_started:
+                silence_chunks += 1
+                # Stop 1.0s (5 chunks) after user finishes speaking!
+                if silence_chunks >= 5:
+                    log.info("Speech ended cleanly at %.1fs", (idx + 1) * 0.2)
+                    break
+            elif idx >= wait_chunks:
+                # Nobody spoke within wait window -> exit cleanly without wasting API call!
+                log.info("Silence timeout (no speech detected).")
+                return None
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=1.0)
+        except Exception:
+            proc.kill()
+
+    if not speech_started:
+        return None
+
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000)
+        wf.writeframes(b"".join(recorded_chunks))
+    return buf.getvalue()
+
+
+def record_voice(wait_speech_sec: float = 4.0) -> Optional[bytes]:
+    """Auto-detects USB Mic / Bluetooth Neckband / Laptop Mic and records with fast VAD."""
+    global _cached_mic_mode
+
+    # Try cached mic first for zero-delay follow-ups
+    if _cached_mic_mode is None:
         usb_dev = _find_usb_alsa_mic()
         if usb_dev and shutil.which("arecord"):
+            _cached_mic_mode = ("usb", usb_dev)
             robot["mic_info"] = f"USB Mic ({usb_dev})"
-            cmd = ["arecord", "-D", usb_dev, "-f", "S16_LE", "-r", "16000", "-c", "1", "-d", str(int(duration)), str(wav_path)]
-            if subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0 and wav_path.exists():
-                return wav_path.read_bytes()
+        else:
+            bt_src = _find_bluetooth_source()
+            if bt_src and shutil.which("parecord"):
+                _cached_mic_mode = ("bt", bt_src)
+                robot["mic_info"] = f"Bluetooth Mic ({bt_src[:20]})"
+            elif shutil.which("parecord"):
+                _cached_mic_mode = ("pa", None)
+                robot["mic_info"] = "System Mic (parecord)"
+            else:
+                _cached_mic_mode = ("sd", None)
 
-        # Priority 2: Bluetooth Neckband / Headset Mic (e.g. Zebronics) via PipeWire / PulseAudio
-        bt_src = _find_bluetooth_source()
-        if bt_src:
-            robot["mic_info"] = f"Bluetooth Mic ({bt_src[:22]})"
-            if shutil.which("parecord"):
-                cmd = ["timeout", str(int(duration) + 1), "parecord", "-d", bt_src, "--rate=16000", "--channels=1", "--format=s16le", "--file-format=wav", str(wav_path)]
-                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                if wav_path.exists() and wav_path.stat().st_size > 1000:
-                    return wav_path.read_bytes()
-
-        # Priority 3: PipeWire / PulseAudio default mic
-        for tool in ("pw-record", "parecord"):
-            if shutil.which(tool):
-                robot["mic_info"] = f"System Mic ({tool})"
-                args = [tool, "--rate", "16000", "--channels", "1", str(wav_path)] if tool == "pw-record" else [tool, "--rate=16000", "--channels=1", "--file-format=wav", str(wav_path)]
-                subprocess.run(["timeout", str(int(duration)), *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                if wav_path.exists() and wav_path.stat().st_size > 1000:
-                    return wav_path.read_bytes()
-
-        # Priority 4: sounddevice (Laptop / Windows mic or default PortAudio)
-        try:
+    mode, dev = _cached_mic_mode
+    try:
+        if mode == "usb":
+            cmd = ["arecord", "-D", dev, "-f", "S16_LE", "-r", "16000", "-c", "1", "-t", "raw", "-q"]
+            return _record_raw_stream_vad(cmd, wait_speech_sec=wait_speech_sec)
+        elif mode == "bt":
+            cmd = ["parecord", "-d", dev, "--raw", "--rate=16000", "--channels=1", "--format=s16le"]
+            return _record_raw_stream_vad(cmd, wait_speech_sec=wait_speech_sec)
+        elif mode == "pa":
+            cmd = ["parecord", "--raw", "--rate=16000", "--channels=1", "--format=s16le"]
+            return _record_raw_stream_vad(cmd, wait_speech_sec=wait_speech_sec)
+        else:
             import sounddevice as sd
             robot["mic_info"] = "Default Mic (sounddevice)"
-            rec = sd.rec(int(duration * 16000), samplerate=16000, channels=1, dtype="int16")
+            rec = sd.rec(int(min(4.0, MAX_RECORD_SEC) * 16000), samplerate=16000, channels=1, dtype="int16")
             sd.wait()
-            with wave.open(str(wav_path), "wb") as wf:
-                wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000); wf.writeframes(rec.tobytes())
-            return wav_path.read_bytes()
-        except Exception as e:
-            log.warning("No working microphone found (%s)", e)
-            robot["mic_info"] = "No Mic Found"
-            return None
-    finally:
-        if wav_path.exists():
-            wav_path.unlink(missing_ok=True)
+            raw = rec.tobytes()
+            if _chunk_rms(raw) < 120.0:
+                return None
+            buf = io.BytesIO()
+            with wave.open(buf, "wb") as wf:
+                wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000); wf.writeframes(raw)
+            return buf.getvalue()
+    except Exception as e:
+        log.warning("Mic recording error (%s) — resetting mic cache.", e)
+        _cached_mic_mode = None
+        robot["mic_info"] = "No Mic Found"
+        return None
+
+
+def play_ready_beep():
+    """Plays a super quick 0.12s soft chime so user knows robot is listening for next question."""
+    if not robot["speaker_on"]:
+        return
+    beep_path = TEMP_DIR / "ready_beep.wav"
+    if not beep_path.exists():
+        # Generate tiny 0.12s 587Hz chime once and cache on disk
+        frames = bytearray()
+        for i in range(int(16000 * 0.12)):
+            env = math.sin(math.pi * i / (16000 * 0.12))
+            val = int(6000.0 * env * math.sin(2.0 * math.pi * 587.0 * i / 16000))
+            frames.extend(val.to_bytes(2, "little", signed=True))
+        with wave.open(str(beep_path), "wb") as wf:
+            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000); wf.writeframes(frames)
+
+    if sys.platform.startswith("linux"):
+        for cmd in (["pw-play", str(beep_path)], ["paplay", str(beep_path)], ["aplay", "-q", str(beep_path)]):
+            if shutil.which(cmd[0]):
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                break
+    elif sys.platform.startswith("win"):
+        subprocess.run(["powershell", "-c", f"(New-Object Media.SoundPlayer '{beep_path}').PlaySync()"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def speak_text(text: str, lang: str = "en"):
-    """Synthesizes TTS (edge-tts -> gTTS fallback) and plays on available speaker (Bluetooth -> USB/HDMI)."""
+    """Synthesizes TTS (edge-tts -> gTTS fallback) and plays on best available speaker."""
     if not text.strip() or not robot["speaker_on"]:
         return
 
@@ -278,33 +399,29 @@ def speak_text(text: str, lang: str = "en"):
     voice = TTS_VOICES.get(lang, TTS_VOICES["en"])
     synthesized = False
 
-    # 1. Try edge-tts
     try:
         import edge_tts
         async def _synth():
-            await edge_tts.Communicate(text, voice).save(str(mp3_path))
+            await asyncio.wait_for(edge_tts.Communicate(text, voice).save(str(mp3_path)), timeout=6.0)
         asyncio.run(_synth())
         synthesized = mp3_path.exists() and mp3_path.stat().st_size > 300
     except Exception as e:
-        log.warning("edge-tts failed (%s), falling back to gTTS...", e)
+        log.warning("edge-tts failed (%s), using gTTS fallback...", e)
 
-    # 2. Try gTTS fallback
     if not synthesized:
         try:
             from gtts import gTTS
             gTTS(text=text, lang=lang if lang in ("en", "te", "hi") else "en").save(str(mp3_path))
             synthesized = mp3_path.exists() and mp3_path.stat().st_size > 300
         except Exception as e:
-            log.error("gTTS also failed: %s", e)
+            log.error("gTTS failed: %s", e)
 
     if not synthesized:
         return
 
-    # 3. Play on best available speaker
     try:
         if sys.platform.startswith("linux"):
-            # Ensure Bluetooth sink is set as default if connected
-            if shutil.which("pactl"):
+            if shutil.which("pactl") and robot["speaker_info"] == "Detecting...":
                 try:
                     sinks = subprocess.check_output(["pactl", "list", "short", "sinks"], text=True, stderr=subprocess.DEVNULL)
                     bt_sinks = [l.split()[1] for l in sinks.splitlines() if "bluez" in l]
@@ -332,7 +449,7 @@ def speak_text(text: str, lang: str = "en"):
 
 
 # ==============================================================================
-# 4. FAST 2.8" SPI TFT DISPLAY (DIRECT SPIDEV + NUMPY)
+# 4. ZERO-LAG 2.8" SPI TFT DISPLAY (DIRTY-FRAME CACHING + NUMPY)
 # ==============================================================================
 class SimpleTFT:
     def __init__(self):
@@ -341,9 +458,8 @@ class SimpleTFT:
         self.mock = MOCK_HARDWARE
         self.font_sm = self._load_font(["NotoSans-Regular.ttf", "DejaVuSans.ttf", "arial.ttf"], 13)
         self.font_md = self._load_font(["NotoSans-Regular.ttf", "DejaVuSans.ttf", "arial.ttf"], 16)
-        self.font_te = self._load_font(["NotoSansTelugu-Regular.ttf", "Nirmala.ttf"], 15)
-        self.font_hi = self._load_font(["NotoSansDevanagari-Regular.ttf", "Nirmala.ttf"], 15)
         self.tick = 0
+        self._last_signature = None
 
         if not self.mock:
             try:
@@ -366,8 +482,7 @@ class SimpleTFT:
                 self.mock = True
 
     def _load_font(self, names, size):
-        search_dirs = [BASE_DIR / "assets" / "fonts", Path("/usr/share/fonts/truetype/noto"), Path("/usr/share/fonts/truetype/dejavu"), Path("C:/Windows/Fonts")]
-        for d in search_dirs:
+        for d in [BASE_DIR / "assets" / "fonts", Path("/usr/share/fonts/truetype/noto"), Path("/usr/share/fonts/truetype/dejavu"), Path("C:/Windows/Fonts")]:
             for n in names:
                 p = d / n
                 if p.exists():
@@ -378,8 +493,7 @@ class SimpleTFT:
         return ImageFont.load_default()
 
     def _cmd(self, c):
-        self.GPIO.output(PIN_TFT_DC, self.GPIO.LOW)
-        self.spi.writebytes([c])
+        self.GPIO.output(PIN_TFT_DC, self.GPIO.LOW); self.spi.writebytes([c])
 
     def _dat(self, d):
         self.GPIO.output(PIN_TFT_DC, self.GPIO.HIGH)
@@ -396,41 +510,44 @@ class SimpleTFT:
             (0xB6, [0x08, 0x82, 0x27]), (0x11, None), (0x29, None)
         ]:
             self._cmd(cmd)
-            if data:
-                self._dat(data)
-            if cmd in (0x01, 0x11):
-                time.sleep(0.12)
+            if data: self._dat(data)
+            if cmd in (0x01, 0x11): time.sleep(0.12)
 
-    def render_and_push(self):
+    def render_and_push(self, force: bool = False):
         self.tick += 1
-        img = Image.new("RGB", (320, 240), (12, 16, 28))
-        d = ImageDraw.Draw(img)
-
         with state_lock:
             st, emo = robot["state"], robot["emotion"]
             dist, lang = robot["distance_cm"], robot["detected_lang"]
             txt = robot["reply_native"] if lang == "en" else (robot["reply_romanized"] or robot["reply_native"])
 
-        # Top Status Bar
+        blink = 1 if (self.tick % 12 == 0 and st == "idle") else 0
+        bounce = (self.tick % 2) if st == "speaking" else 0
+        sig = (st, emo, txt, int(dist // 4) if dist > 0 else -1, lang, blink, bounce)
+
+        # Skip redraw if nothing changed -> saves 90% CPU for voice & Gemini!
+        if not force and sig == self._last_signature:
+            return
+        self._last_signature = sig
+
+        img = Image.new("RGB", (320, 240), (12, 16, 28))
+        d = ImageDraw.Draw(img)
+
         d.rectangle([(0, 0), (320, 26)], fill=(22, 28, 44))
         d.text((10, 6), st.upper(), fill=EMOTION_COLORS.get(emo, (0, 212, 255)), font=self.font_sm)
         d.text((135, 6), f"[{lang.upper()}]", fill=(0, 212, 255), font=self.font_sm)
         d.text((225, 6), f"{int(dist)}cm" if dist > 0 else "-- cm", fill=(160, 174, 192), font=self.font_sm)
 
-        # Animated Robot Eyes
         color = EMOTION_COLORS.get(emo, (0, 212, 255))
-        blink = 0.15 if (self.tick % 20 == 0) else 1.0
-        dy = int(math.sin(self.tick * 0.7) * 4) if st == "speaking" else 0
-        h = max(6, int(54 * blink))
+        dy = -4 if bounce else 0
+        h = 10 if blink else 54
         for cx in (95, 225):
-            if emo == "happy" and blink > 0.5:
+            if emo == "happy" and not blink:
                 d.arc([cx - 30, 65, cx + 30, 125], start=190, end=350, fill=color, width=7)
             else:
                 d.rounded_rectangle([cx - 30, 92 - h // 2 + dy, cx + 30, 92 + h // 2 + dy], radius=14, fill=color)
-                if blink > 0.5:
+                if not blink:
                     d.ellipse([cx + 10, 92 - h // 2 + 8 + dy, cx + 18, 92 - h // 2 + 16 + dy], fill=(255, 255, 255))
 
-        # Subtitle Card
         d.rounded_rectangle([(10, 160), (310, 232)], radius=8, fill=(22, 28, 44), outline=(45, 55, 72))
         words, lines, cur = txt.split(), [], ""
         for w in words:
@@ -438,8 +555,7 @@ class SimpleTFT:
                 cur = f"{cur} {w}".strip()
             else:
                 lines.append(cur); cur = w
-        if cur:
-            lines.append(cur)
+        if cur: lines.append(cur)
         for i, line in enumerate(lines[:3]):
             d.text((18, 168 + i * 20), line, fill=(255, 255, 255), font=self.font_md)
 
@@ -467,17 +583,14 @@ class SimpleTFT:
 # 5. ULTRASONIC SENSOR (HIGH-PRECISION PULSE TIMING)
 # ==============================================================================
 def ultrasonic_worker():
-    """Monitors HC-SR04 using perf_counter() so microsecond pulses aren't missed."""
     if MOCK_HARDWARE:
         robot["distance_cm"] = 120.0
         return
 
     try:
         import RPi.GPIO as GPIO
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setwarnings(False)
-        GPIO.setup(PIN_TRIG, GPIO.OUT)
-        GPIO.setup(PIN_ECHO, GPIO.IN)
+        GPIO.setmode(GPIO.BCM); GPIO.setwarnings(False)
+        GPIO.setup(PIN_TRIG, GPIO.OUT); GPIO.setup(PIN_ECHO, GPIO.IN)
         GPIO.output(PIN_TRIG, GPIO.LOW)
         time.sleep(0.3)
         log.info("Ultrasonic HC-SR04 active on TRIG=GPIO%d, ECHO=GPIO%d", PIN_TRIG, PIN_ECHO)
@@ -485,18 +598,21 @@ def ultrasonic_worker():
         log.warning("Ultrasonic GPIO init failed: %s", e)
         return
 
-    no_echo_warned = False
-    valid_count = 0
+    no_echo_warned, valid_count = False, 0
 
     while True:
+        # Pause pinging during active conversation to keep 100% CPU free for voice/AI
+        if robot["state"] != "idle":
+            time.sleep(0.5)
+            continue
+
         try:
-            # 10us trigger pulse
             GPIO.output(PIN_TRIG, GPIO.HIGH)
             time.sleep(0.000012)
             GPIO.output(PIN_TRIG, GPIO.LOW)
 
             t0 = time.perf_counter()
-            deadline = t0 + 0.035  # 35ms timeout (~600cm)
+            deadline = t0 + 0.035
 
             while GPIO.input(PIN_ECHO) == 0:
                 t0 = time.perf_counter()
@@ -524,10 +640,10 @@ def ultrasonic_worker():
                     robot["distance_cm"] = -1.0
                 if not no_echo_warned and valid_count == 0:
                     no_echo_warned = True
-                    log.warning("Ultrasonic: No ECHO on GPIO%d. Ensure VCC=5V (Pin 2) and ECHO->1k/2k divider->GPIO%d!", PIN_ECHO, PIN_ECHO)
+                    log.warning("Ultrasonic: No ECHO on GPIO%d. Check 5V VCC & 1k/2k divider!", PIN_ECHO)
         except Exception:
             pass
-        time.sleep(0.25)
+        time.sleep(0.3)
 
 
 def maybe_wake_robot(dist: float):
@@ -540,58 +656,84 @@ def maybe_wake_robot(dist: float):
 
 
 # ==============================================================================
-# 6. CONVERSATION PIPELINE
+# 6. CONTINUOUS MULTI-TURN CONVERSATION PIPELINE
 # ==============================================================================
 def handle_reply(user_text: str, res: RobotReply, speak: bool = True):
+    u_txt = user_text or res.user_transcript or "[Voice]"
     with state_lock:
         robot["detected_lang"] = res.detected_language
         robot["reply_native"] = res.reply_native
         robot["reply_romanized"] = res.reply_romanized
         robot["emotion"] = res.emotion
-        if user_text:
-            robot["messages"].append({"sender": "YOU", "text": user_text, "lang": res.detected_language})
+        chat_history.append({"role": "User", "text": u_txt})
+        chat_history.append({"role": "Easibot", "text": res.reply_english})
+        if len(chat_history) > 12:
+            del chat_history[:-12]
+
+        robot["messages"].append({"sender": "YOU", "text": u_txt, "lang": res.detected_language})
         robot["messages"].append({"sender": "BOT", "text": res.reply_native, "en": res.reply_english, "lang": res.detected_language})
         robot["messages"] = robot["messages"][-30:]
 
     if speak and robot["speaker_on"]:
         with state_lock:
-            robot["state"] = "speaking"
-            robot["emotion"] = "speaking"
+            robot["state"], robot["emotion"] = "speaking", "speaking"
         speak_text(res.reply_native, res.detected_language)
-
-    with state_lock:
-        robot["state"] = "idle"
-        robot["emotion"] = "happy"
 
 
 def run_voice_cycle(from_wake: bool = False):
+    """Continuous multi-turn chat loop: listens -> answers -> speaks -> immediately listens for follow-up!"""
+    global last_wake_time
     if not voice_busy_lock.acquire(blocking=False):
         return
+
     try:
-        if from_wake and robot["speaker_on"]:
+        turn = 0
+        while True:
+            turn += 1
+            if turn == 1 and from_wake and robot["speaker_on"]:
+                with state_lock:
+                    robot["state"], robot["emotion"] = "speaking", "happy"
+                    robot["reply_native"] = "Hi! Ask me anything."
+                speak_text("Hi! Ask me anything.", "en")
+            else:
+                play_ready_beep()
+
             with state_lock:
-                robot["state"], robot["emotion"] = "speaking", "happy"
-                robot["reply_native"] = "Hello! I am listening..."
-            speak_text("Hello! I am listening.", "en")
+                robot["state"], robot["emotion"] = "listening", "listening"
+                robot["reply_native"] = "Listening..." if turn == 1 else "Listening for next question..."
 
-        with state_lock:
-            robot["state"], robot["emotion"] = "listening", "listening"
-            robot["reply_native"] = "Listening..."
+            # Wait up to 4.5s for speech to begin; if silent, exit continuous chat gracefully
+            wav = record_voice(wait_speech_sec=4.5)
+            if not wav:
+                with state_lock:
+                    robot["state"], robot["emotion"] = "idle", "happy"
+                    robot["reply_native"] = "Ready! Ask anytime." if turn > 1 else "No speech heard."
+                break
 
-        wav = record_voice(RECORD_SEC)
-        if not wav:
             with state_lock:
-                robot["state"], robot["emotion"] = "idle", "neutral"
-                robot["reply_native"] = "No mic detected. Use Web Chat!"
-            return
+                robot["state"], robot["emotion"] = "thinking", "thinking"
+                robot["reply_native"] = "Thinking..."
 
-        with state_lock:
-            robot["state"], robot["emotion"] = "thinking", "thinking"
-            robot["reply_native"] = "Thinking..."
+            res = ask_gemini(audio_wav=wav, lang_pref=robot["language"])
+            if not res.user_transcript.strip() and res.end_conversation:
+                with state_lock:
+                    robot["state"], robot["emotion"] = "idle", "happy"
+                    robot["reply_native"] = "Ready! Ask anytime."
+                break
 
-        res = ask_gemini(audio_wav=wav, lang_pref=robot["language"])
-        handle_reply("[Voice Input]", res, speak=True)
+            handle_reply(res.user_transcript, res, speak=True)
+
+            # Stop loop if user said bye or continuous chat disabled
+            if res.end_conversation or not robot["continuous_chat"]:
+                with state_lock:
+                    robot["state"], robot["emotion"] = "idle", "happy"
+                break
+
+        last_wake_time = time.time()
     finally:
+        with state_lock:
+            if robot["state"] in ("listening", "thinking", "speaking"):
+                robot["state"], robot["emotion"] = "idle", "happy"
         voice_busy_lock.release()
 
 
@@ -602,7 +744,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Easibot Simple Dashboard</title>
+<title>Easibot Fast Dashboard</title>
 <style>
   body { background:#0b1120; color:#f1f5f9; font-family:system-ui,sans-serif; max-width:720px; margin:0 auto; padding:16px; }
   .card { background:#162032; border:1px solid #26334d; border-radius:12px; padding:16px; margin-bottom:14px; }
@@ -615,7 +757,7 @@ HTML_PAGE = """<!DOCTYPE html>
   .sub { font-size:12px; color:#94a3b8; margin-top:4px; }
   input, select, button { padding:10px 14px; border-radius:8px; border:1px solid #334155; background:#0f172a; color:#fff; font-size:14px; }
   button { background:#00d4ff; color:#041226; font-weight:700; cursor:pointer; border:none; }
-  button.mic { background:#f43f5e; color:#fff; width:100%; margin-top:8px; }
+  button.mic { background:#f43f5e; color:#fff; width:100%; margin-top:10px; }
 </style>
 </head>
 <body>
@@ -632,15 +774,16 @@ HTML_PAGE = """<!DOCTYPE html>
         <option value="te">తెలుగు (Telugu)</option>
         <option value="hi">हिंदी (Hindi)</option>
       </select>
-      <label><input type="checkbox" id="spkOn" checked onchange="toggleSpk()"> 🔊 Speak on Speaker</label>
+      <label><input type="checkbox" id="spkOn" checked onchange="toggleSpk()"> 🔊 Speaker</label>
+      <label><input type="checkbox" id="contOn" checked onchange="toggleCont()"> 🔁 Continuous Chat</label>
     </div>
-    <button class="mic" onclick="fetch('/api/listen',{method:'POST'})">🎙️ Trigger Voice Listen (USB / Bluetooth Mic)</button>
+    <button class="mic" onclick="fetch('/api/listen',{method:'POST'})">🎙️ Start Continuous Voice Chat</button>
   </div>
 
   <div class="card">
     <div id="chat"></div>
     <form onsubmit="sendMsg(event)" class="row">
-      <input id="txt" style="flex:1" placeholder="Type in English, Telugu, or Hindi..." autocomplete="off">
+      <input id="txt" style="flex:1" placeholder="Ask anything (follow-ups remembered!)..." autocomplete="off">
       <button type="submit">Send</button>
     </form>
   </div>
@@ -668,6 +811,7 @@ async function sendMsg(e) {
 }
 function setLang() { fetch('/api/lang', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({lang:document.getElementById('lang').value})}); }
 function toggleSpk() { fetch('/api/speaker', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({on:document.getElementById('spkOn').checked})}); }
+function toggleCont() { fetch('/api/continuous', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({on:document.getElementById('contOn').checked})}); }
 setInterval(refresh, 1000); refresh();
 </script>
 </body>
@@ -697,7 +841,11 @@ def api_chat():
     with state_lock:
         robot["state"], robot["emotion"] = "thinking", "thinking"
     res = ask_gemini(text_query=msg, lang_pref=robot["language"])
-    threading.Thread(target=handle_reply, args=(msg, res, data.get("speak", True)), daemon=True).start()
+    def _finish():
+        handle_reply(msg, res, data.get("speak", True))
+        with state_lock:
+            robot["state"], robot["emotion"] = "idle", "happy"
+    threading.Thread(target=_finish, daemon=True).start()
     return jsonify({"ok": True})
 
 
@@ -719,22 +867,28 @@ def api_speaker():
     return jsonify({"ok": True})
 
 
+@app.route("/api/continuous", methods=["POST"])
+def api_continuous():
+    robot["continuous_chat"] = bool((request.get_json() or {}).get("on", True))
+    return jsonify({"ok": True})
+
+
 # ==============================================================================
 # 8. MAIN ENTRY POINT
 # ==============================================================================
 if __name__ == "__main__":
-    log.info("Starting Easibot Simple Edition (MOCK_HARDWARE=%s)...", MOCK_HARDWARE)
+    log.info("Starting Easibot Fast Edition (Model=%s, MOCK=%s, TRIG=GPIO%d, ECHO=GPIO%d)...", GEMINI_MODEL, MOCK_HARDWARE, PIN_TRIG, PIN_ECHO)
 
     tft = SimpleTFT()
+    tft.render_and_push(force=True)
     threading.Thread(target=ultrasonic_worker, daemon=True).start()
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=WEB_PORT, debug=False, use_reloader=False), daemon=True).start()
 
     log.info("Web Dashboard available at http://localhost:%d", WEB_PORT)
 
-    # Display animation loop (~5 FPS: smooth eyes, ultra-low CPU so ultrasonic never drops echoes!)
     try:
         while True:
             tft.render_and_push()
-            time.sleep(0.2)
+            time.sleep(0.35)
     except KeyboardInterrupt:
         log.info("Easibot stopped.")

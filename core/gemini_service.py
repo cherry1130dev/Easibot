@@ -99,7 +99,7 @@ class GeminiService:
             return self._generate_fallback_response(user_query, language_preference)
 
         models_to_try = [self.model_name]
-        for fallback_m in ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.8-flash"]:
+        for fallback_m in ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash"]:
             if fallback_m not in models_to_try:
                 models_to_try.append(fallback_m)
 
@@ -133,7 +133,7 @@ class GeminiService:
             return self._generate_fallback_response("Voice Query", language_preference)
 
         models_to_try = [self.model_name]
-        for fallback_m in ["gemini-3.5-flash", "gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.8-flash"]:
+        for fallback_m in ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash"]:
             if fallback_m not in models_to_try:
                 models_to_try.append(fallback_m)
 
